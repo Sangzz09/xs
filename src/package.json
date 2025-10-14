@@ -1,16 +1,13 @@
 {
-  "name": "botrumsunwin-hybridplus-v21",
+  "name": "botrumsunwin-hybridplus-v21-full",
   "version": "1.0.0",
-  "description": "BOTRUMSUNWIN HYBRIDPLUS v21 - API chính thức by @minhsangdangcap",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
-    "express": "^4.19.2",
-    "cors": "^2.8.5",
-    "fs-extra": "^11.2.0",
-    "body-parser": "^1.20.2",
-    "chalk": "^4.1.2"
+    "axios": "^1.7.2",
+    "chalk": "^4.1.2",
+    "express": "^4.18.2"
   }
 }
