@@ -1,6 +1,7 @@
 {
-  "name": "botrumsunwin-hybridplus-v21-full",
+  "name": "sunwin-hybridplus-v22",
   "version": "1.0.0",
+  "description": "BOTRUMSUNWIN HYBRIDPLUS v22 tích hợp AI đa tầng linh hoạt",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
