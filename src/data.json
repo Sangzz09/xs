@@ -1,3 +1,9 @@
 {
-  "pattern": []
+  "history": [],
+  "patternTXT": "",
+  "predictions": [],
+  "lastPredicted": null,
+  "lastActual": null,
+  "streakLose": 0,
+  "streakWin": 0
 }
