@@ -1,6 +1,7 @@
-// BOTRUMSUNWIN HYBRIDPLUS v22.2
-// @minhsangdangcap — Tích hợp AI Cầu Đa Yếu Tố + Đa Tầng Linh Hoạt
-// Hiển thị kết quả, tổng xúc xắc, pattern, loại cầu, thống kê đầy đủ
+// BOTRUMSUNWIN HYBRIDPLUS v22.4 FINAL
+// @minhsangdangcap — AI Cầu Đa Yếu Tố + Đa Tầng Linh Hoạt
+// Đồng bộ chuẩn phiên hackvn.xyz, auto reset thông minh
+// Không hiển thị trường "Reset" trong JSON API
 
 const express = require("express");
 const axios = require("axios");
@@ -19,9 +20,11 @@ const STATS_FILE = path.join(__dirname, "stats.json");
 let data = { history: [], lastPredict: null };
 let stats = { tong: 0, dung: 0, sai: 0, reset: 0 };
 
+// Đọc file lưu nếu có
 if (fs.existsSync(DATA_FILE)) data = JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
 if (fs.existsSync(STATS_FILE)) stats = JSON.parse(fs.readFileSync(STATS_FILE, "utf8"));
 
+// Lưu toàn bộ dữ liệu
 function saveAll() {
   fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
   fs.writeFileSync(STATS_FILE, JSON.stringify(stats, null, 2));
@@ -32,16 +35,58 @@ function safeInt(v) {
   return Number.isFinite(n) ? n : 0;
 }
 
-function parseItem(item) {
-  const phien = safeInt(item.phien || item.id);
-  const tong = safeInt(item.tong);
-  const ket_qua = item.ket_qua?.trim() || (tong >= 11 ? "Tài" : "Xỉu");
-  const xuc_xac = [
-    safeInt(item.xuc_xac_1),
-    safeInt(item.xuc_xac_2),
-    safeInt(item.xuc_xac_3),
-  ].filter(Boolean);
-  return { phien, ket_qua, xuc_xac, tong_xuc_xac: tong };
+// ========================== LẤY DỮ LIỆU API ==========================
+async function fetchLatest() {
+  try {
+    const res = await axios.get(API_HISTORY, { timeout: 8000 });
+    let payload = res.data;
+
+    // Nếu API trả chuỗi JSON → parse lại
+    if (typeof payload === "string") {
+      try {
+        payload = JSON.parse(payload);
+      } catch {
+        console.log(chalk.red("⚠️ API trả chuỗi không hợp lệ JSON"));
+        return;
+      }
+    }
+
+    // Nếu trả mảng → lấy phần tử đầu tiên
+    if (Array.isArray(payload) && payload.length > 0) payload = payload[0];
+
+    // Chuẩn hoá dữ liệu
+    const phien = safeInt(payload.phien || payload.id || payload.session);
+    const tong = safeInt(payload.tong || payload.total);
+    const ket_qua = (payload.ket_qua || (tong >= 11 ? "Tài" : "Xỉu")).trim();
+    const xuc_xac = [
+      safeInt(payload.xuc_xac_1),
+      safeInt(payload.xuc_xac_2),
+      safeInt(payload.xuc_xac_3),
+    ].filter(Boolean);
+
+    if (!phien) {
+      console.log(chalk.yellow("⚠️ Không có số phiên hợp lệ từ API"));
+      return;
+    }
+
+    const lastPhien = data.history[0]?.phien;
+    console.log(chalk.gray(`API trả phien=${phien} | lastPhien=${lastPhien}`));
+
+    // Nếu là phiên mới
+    if (!lastPhien || phien > lastPhien) {
+      const item = { phien, ket_qua, tong_xuc_xac: tong, xuc_xac };
+      data.history.unshift(item);
+      if (data.history.length > 400) data.history = data.history.slice(0, 400);
+      handlePredict(item);
+    }
+  } catch (e) {
+    console.log(chalk.red("❌ Lỗi fetch API:"), e.message);
+  }
+}
+
+// ========================== PHÂN TÍCH & DỰ ĐOÁN ==========================
+function seq(history, n = 20) {
+  return history.slice(0, n).map(h => (h.ket_qua[0] === "T" ? "T" : "X")).join("");
 }
 
 function analyzePattern(seq) {
@@ -56,140 +101,79 @@ function analyzePattern(seq) {
   return { type: "none", name: "Không có pattern mạnh", score: 0.5 };
 }
 
-function seq(history, n = 20) {
-  return history
-    .slice(0, n)
-    .map((h) => (h.ket_qua[0] === "T" ? "T" : "X"))
-    .join("");
-}
-
 function aiCauDaYeuTo(history) {
-  const seqStr = seq(history);
+  const seqStr = seq(history, 20);
   const pattern = analyzePattern(seqStr);
   const last10 = history.slice(0, 10);
-  const taiCount = last10.filter((h) => h.ket_qua === "Tài").length;
+  const taiCount = last10.filter(h => h.ket_qua === "Tài").length;
   const xiuCount = last10.length - taiCount;
-  const momentum = (taiCount - xiuCount) / (last10.length || 1);
-  const trend = taiCount > xiuCount ? "Tài" : "Xỉu";
+  const trend = taiCount >= xiuCount ? "Tài" : "Xỉu";
   let du_doan = trend;
-  let conf = 0.55;
-  switch (pattern.type) {
-    case "bet":
-      du_doan = pattern.name.includes("Tài") ? "Tài" : "Xỉu";
-      conf = pattern.score;
-      break;
-    case "alt":
-      du_doan = history[0]?.ket_qua === "Tài" ? "Xỉu" : "Tài";
-      conf = 0.7;
-      break;
-    case "22":
-      du_doan = trend;
-      conf = 0.68;
-      break;
-    case "zigzag":
-      du_doan = trend === "Tài" ? "Xỉu" : "Tài";
-      conf = 0.65;
-      break;
-    default:
-      du_doan = momentum > 0 ? "Tài" : "Xỉu";
-      conf = 0.55 + Math.abs(momentum) * 0.3;
-  }
+  let conf = pattern.score || 0.55;
+
+  if (pattern.type === "alt") du_doan = history[0]?.ket_qua === "Tài" ? "Xỉu" : "Tài";
+  else if (pattern.type === "zigzag") du_doan = trend === "Tài" ? "Xỉu" : "Tài";
+
   return { du_doan, confidence: conf, pattern };
 }
 
 function aiDaTangLinhHoat(history) {
-  if (history.length < 5) {
-    const tongTb =
-      history.reduce((a, b) => a + (b.tong_xuc_xac || 0), 0) /
-      (history.length || 1);
-    return {
-      du_doan: tongTb >= 11 ? "Tài" : "Xỉu",
-      confidence: 0.6,
-      name: "Dựa tổng xúc xắc",
-    };
-  }
   const last = history.slice(0, 10);
   const counts = { Tài: 0, Xỉu: 0 };
   for (const h of last) counts[h.ket_qua]++;
-  const trend = counts.Tài > counts.Xỉu ? "Tài" : "Xỉu";
-  const rate = Math.abs(counts.Tài - counts.Xỉu) / 10;
-  return {
-    du_doan: trend,
-    confidence: 0.6 + rate * 0.3,
-    name: "Đa tầng linh hoạt V1",
-  };
+  const trend = counts.Tài >= counts.Xỉu ? "Tài" : "Xỉu";
+  const conf = 0.6 + Math.abs(counts.Tài - counts.Xỉu) * 0.03;
+  return { du_doan: trend, confidence: conf, name: "Đa tầng linh hoạt V1" };
 }
 
-async function fetchLatest() {
-  try {
-    const res = await axios.get(API_HISTORY, { timeout: 6000 });
-    const arr = Array.isArray(res.data) ? res.data : [res.data];
-    const parsed = arr.map(parseItem).filter(Boolean);
-    if (!parsed.length) return console.log(chalk.yellow("⚠️ Không có dữ liệu mới"));
-    const item = parsed[0];
-    const lastPhien = data.history[0]?.phien;
-    if (lastPhien && item.phien <= lastPhien) return;
+// ========================== DỰ ĐOÁN VÀ GHI ==========================
+function handlePredict(current) {
+  // Xử lý đúng/sai của phiên trước
+  if (data.lastPredict) {
+    if (data.lastPredict.du_doan === current.ket_qua) stats.dung++;
+    else stats.sai++;
 
-    data.history.unshift(item);
-    if (data.history.length > 400) data.history = data.history.slice(0, 400);
+    const total = stats.dung + stats.sai;
+    const tile = total ? (stats.dung / total) * 100 : 0;
 
-    if (data.lastPredict) {
-      if (data.lastPredict.du_doan === item.ket_qua) stats.dung++;
-      else stats.sai++;
-      const total = stats.dung + stats.sai;
-      const tile = total ? (stats.dung / total) * 100 : 0;
-      if (stats.sai >= 3 && stats.dung <= stats.sai) {
-        console.log(chalk.red("⚠️ Sai 3 lần liên tiếp → RESET pattern!"));
-        data.history = data.history.slice(0, 5);
-        stats.reset++;
-        stats.sai = 0;
-        stats.dung = 0;
-      } else if (tile < 55 && total > 10) {
-        console.log(chalk.yellow("⚠️ Tỷ lệ đúng thấp → Reset nhẹ!"));
-        data.history = data.history.slice(0, 10);
-        stats.reset++;
-      }
+    if (stats.sai >= 3 && stats.dung <= stats.sai) {
+      console.log(chalk.red("⚠️ Sai 3 lần liên tiếp → reset pattern"));
+      data.history = data.history.slice(0, 5);
+      stats.reset++;
+      stats.sai = 0;
+      stats.dung = 0;
+    } else if (tile < 55 && total > 10) {
+      console.log(chalk.yellow("⚠️ Tỷ lệ đúng thấp → reset nhẹ"));
+      data.history = data.history.slice(0, 10);
+      stats.reset++;
     }
-
-    const h = data.history.filter((h) => h.ket_qua !== "Chưa có");
-    const ai1 = aiCauDaYeuTo(h);
-    const ai2 = aiDaTangLinhHoat(h);
-    const final = ai1.confidence >= ai2.confidence ? ai1 : ai2;
-    const nextPhien = item.phien + 1;
-
-    const predict = {
-      phien: nextPhien,
-      du_doan: final.du_doan,
-      confidence: final.confidence,
-      thuat_toan: final.pattern?.name || final.name,
-      pattern: seq(h, 10),
-      last_ket_qua: item.ket_qua,
-      tong: item.tong_xuc_xac,
-      xuc_xac: item.xuc_xac,
-    };
-
-    data.lastPredict = predict;
-    stats.tong++;
-    saveAll();
-
-    console.log(
-      chalk.green(
-        `🔮 Phiên ${nextPhien}: ${final.du_doan} (${Math.round(
-          final.confidence * 100
-        )}%) | ${final.thuat_toan}`
-      )
-    );
-  } catch (e) {
-    console.log(chalk.red("❌ Lỗi API:"), e.message);
-    if (e.response)
-      console.log("🔎 Response:", e.response.status, e.response.data);
   }
+
+  // Phân tích và dự đoán
+  const h = data.history.filter(h => h.ket_qua !== "Chưa có");
+  const ai1 = aiCauDaYeuTo(h);
+  const ai2 = aiDaTangLinhHoat(h);
+  const final = ai1.confidence >= ai2.confidence ? ai1 : ai2;
+
+  const predict = {
+    phien: current.phien + 1,
+    du_doan: final.du_doan,
+    confidence: final.confidence,
+    thuat_toan: final.pattern?.name || final.name,
+    pattern: seq(h, 10),
+    last_ket_qua: current.ket_qua,
+    tong: current.tong_xuc_xac,
+    xuc_xac: current.xuc_xac,
+  };
+
+  data.lastPredict = predict;
+  stats.tong++;
+  saveAll();
+
+  console.log(chalk.green(`🔮 Phiên ${predict.phien}: ${predict.du_doan} (${Math.round(predict.confidence * 100)}%) | ${predict.thuat_toan}`));
 }
 
-fetchLatest();
-setInterval(fetchLatest, 10000);
-
-// ========== API ==========
+// ========================== API ENDPOINTS ==========================
 app.get("/sunwinapi", (req, res) => {
   if (!data.lastPredict) return res.json({ message: "Chưa có dữ liệu" });
   res.json({
@@ -204,7 +188,6 @@ app.get("/sunwinapi", (req, res) => {
     So_lan_du_doan: stats.tong,
     So_dung: stats.dung,
     So_sai: stats.sai,
-    Reset: stats.reset,
     Dev: "@minhsangdangcap",
   });
 });
@@ -216,6 +199,10 @@ app.get("/api/update", async (req, res) => {
   res.json({ ok: true });
 });
 
-app.listen(PORT, () =>
-  console.log(chalk.green(`🚀 HYBRIDPLUS v22.2 chạy tại cổng ${PORT}`))
-);
+// Tự động fetch liên tục
+fetchLatest();
+setInterval(fetchLatest, 10000);
+
+app.listen(PORT, () => {
+  console.log(chalk.green(`🚀 HYBRIDPLUS v22.4 FINAL đang chạy tại cổng ${PORT}`));
+});
