@@ -1,9 +1,5 @@
-// HYBRIDPLUS v25 — Deep Ensemble AI
+// HYBRIDPLUS v25.1 — Deep Ensemble AI (Stable Render Build)
 // Dev: @minhsangdangcap
-// - Giữ nguyên JSON & API format
-// - AI tổ hợp 5 tầng (ensemble prediction)
-// - Tự điều chỉnh trọng số khi sai nhiều
-// - Reset pattern còn 5 phiên khi sai 3 lần liên tiếp
 
 const express = require("express");
 const axios = require("axios");
@@ -18,9 +14,9 @@ const PORT = process.env.PORT || 3000;
 const API_HISTORY = "https://hackvn.xyz/apisun.php";
 const DATA_FILE = path.join(__dirname, "data.json");
 const STATS_FILE = path.join(__dirname, "stats.json");
-const FETCH_INTERVAL_MS = 10000; // 10s
+const FETCH_INTERVAL_MS = 10000;
 
-// =================== STATE ===================
+// ========== LOAD / INIT ==========
 let data = {
   history: [],
   lastPredict: null,
@@ -30,10 +26,15 @@ let data = {
 };
 let stats = { tong: 0, dung: 0, sai: 0, reset: 0 };
 
-// =================== LOAD/SAVE ===================
 function loadAll() {
   try {
-    if (fs.existsSync(DATA_FILE)) data = JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
+    if (fs.existsSync(DATA_FILE)) {
+      const d = JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
+      Object.assign(data, d);
+      // fix thiếu weights
+      if (!data.weights)
+        data.weights = { pattern: 0.25, trend: 0.25, dice: 0.2, momentum: 0.15, memory: 0.15 };
+    }
     if (fs.existsSync(STATS_FILE)) stats = JSON.parse(fs.readFileSync(STATS_FILE, "utf8"));
   } catch (e) {
     console.log("⚠️ Lỗi load file:", e.message);
@@ -50,7 +51,7 @@ function safeInt(v) {
   return Number.isFinite(n) ? n : 0;
 }
 
-// =================== UTILS ===================
+// ========== UTILS ==========
 function seqTX(history, n = 30) {
   return history
     .slice(0, n)
@@ -113,7 +114,7 @@ function memoryPattern(history) {
   return 0;
 }
 
-// =================== ENSEMBLE AI ===================
+// ========== ENSEMBLE AI ==========
 function hybridEnsemblePredict(history) {
   const seq = seqTX(history, 30);
   const pat = analyzePattern(seq);
@@ -122,7 +123,7 @@ function hybridEnsemblePredict(history) {
   const mom = momentum(history);
   const mem = memoryPattern(history);
 
-  const w = data.weights;
+  const w = data.weights || { pattern: 0.25, trend: 0.25, dice: 0.2, momentum: 0.15, memory: 0.15 };
   let raw =
     pat.score * w.pattern +
     t * w.trend +
@@ -130,25 +131,18 @@ function hybridEnsemblePredict(history) {
     mom * w.momentum +
     mem * w.memory;
 
-  // bias theo tổng trung bình
-  const avg = history
-    .slice(0, 8)
-    .reduce((a, b) => a + (b.tong_xuc_xac || 0), 0) / (Math.min(8, history.length) || 1);
+  const avg =
+    history.slice(0, 8).reduce((a, b) => a + (b.tong_xuc_xac || 0), 0) /
+    (Math.min(8, history.length) || 1);
   raw += (avg - 10.5) * 0.05;
 
   const du_doan = raw >= 0 ? "Tài" : "Xỉu";
   const confidence = Math.min(0.95, 0.55 + Math.abs(raw) * 0.45);
 
-  return {
-    du_doan,
-    confidence,
-    patternSeq: seq,
-    patternType: pat.type,
-    raw
-  };
+  return { du_doan, confidence, patternSeq: seq, patternType: pat.type, raw };
 }
 
-// =================== FETCH ===================
+// ========== FETCH API ==========
 async function fetchAPI() {
   try {
     const res = await axios.get(API_HISTORY, { timeout: 8000 });
@@ -158,13 +152,12 @@ async function fetchAPI() {
     const ket_qua = raw.ket_qua || (tong >= 11 ? "Tài" : "Xỉu");
     const xuc_xac = [safeInt(raw.xuc_xac_1), safeInt(raw.xuc_xac_2), safeInt(raw.xuc_xac_3)].filter(Boolean);
     return { phien, ket_qua, tong_xuc_xac: tong, xuc_xac };
-  } catch (e) {
-    console.log("⚠️ Lỗi API:", e.message);
+  } catch {
     return null;
   }
 }
 
-// =================== MAIN ===================
+// ========== MAIN LOOP ==========
 async function importAndPredict() {
   const item = await fetchAPI();
   if (!item) return;
@@ -175,38 +168,26 @@ async function importAndPredict() {
   data.history.unshift(item);
   if (data.history.length > 600) data.history = data.history.slice(0, 600);
 
-  // kiểm tra đúng/sai
   if (data.lastPredict && data.lastPredict.phien === item.phien) {
     const ok = data.lastPredict.du_doan === item.ket_qua;
     if (ok) {
       stats.dung++;
       data.streakWin++;
       data.streakLose = 0;
-      console.log(chalk.green(`✅ Đúng phiên ${item.phien}: ${item.ket_qua}`));
     } else {
       stats.sai++;
       data.streakLose++;
       data.streakWin = 0;
-      console.log(chalk.red(`❌ Sai phiên ${item.phien}: ${item.ket_qua}`));
-      // nếu sai nhiều → giảm trọng số mô hình yếu
-      if (data.streakLose >= 2) {
-        const keys = Object.keys(data.weights);
-        const k = keys[Math.floor(Math.random() * keys.length)];
-        data.weights[k] = Math.max(0.1, data.weights[k] * 0.9);
-        console.log(chalk.yellow(`⚙️ Giảm trọng số ${k} xuống còn ${data.weights[k].toFixed(2)}`));
+      if (data.streakLose >= 3) {
+        data.history = data.history.slice(0, 5);
+        data.streakLose = 0;
+        stats.reset++;
       }
     }
   }
 
-  if (data.streakLose >= 3) {
-    console.log(chalk.yellow("♻ Sai 3 lần liên tiếp → reset pattern về 5 phiên"));
-    data.history = data.history.slice(0, 5);
-    data.streakLose = 0;
-    stats.reset++;
-  }
-
   const ai = hybridEnsemblePredict(data.history);
-  const next = {
+  data.lastPredict = {
     phien: item.phien + 1,
     du_doan: ai.du_doan,
     confidence: ai.confidence,
@@ -217,23 +198,15 @@ async function importAndPredict() {
     tong: item.tong_xuc_xac,
     xuc_xac: item.xuc_xac
   };
-
-  data.lastPredict = next;
   stats.tong++;
   saveAll();
-
-  console.log(
-    chalk.cyanBright(
-      `🔮 Phiên ${next.phien}: ${next.du_doan} (${Math.round(next.confidence * 100)}%) | ${next.patternType}`
-    )
-  );
 }
 
-// =================== LOOP ===================
+// ========== LOOP ==========
 setInterval(importAndPredict, FETCH_INTERVAL_MS);
 importAndPredict();
 
-// =================== API ===================
+// ========== API ==========
 app.get("/sunwinapi", (req, res) => {
   const p = data.lastPredict;
   if (!p) return res.json({ message: "Chưa có dữ liệu" });
@@ -246,7 +219,7 @@ app.get("/sunwinapi", (req, res) => {
     Confidence: `${Math.round(p.confidence * 100)}%`,
     Pattern: p.patternSeq,
     Loai_cau: p.patternType,
-    Thuat_toan: "HYBRID+ DEEP_ENSEMBLE_V25",
+    Thuat_toan: "HYBRID+ DEEP_ENSEMBLE_V25.1",
     So_lan_du_doan: stats.tong,
     So_dung: stats.dung,
     So_sai: stats.sai,
@@ -267,12 +240,18 @@ app.get("/resetpattern", (req, res) => {
 });
 
 app.get("/resetall", (req, res) => {
-  data = { history: [], lastPredict: null, streakLose: 0, streakWin: 0, weights: data.weights };
+  data = {
+    history: [],
+    lastPredict: null,
+    streakLose: 0,
+    streakWin: 0,
+    weights: { pattern: 0.25, trend: 0.25, dice: 0.2, momentum: 0.15, memory: 0.15 }
+  };
   stats = { tong: 0, dung: 0, sai: 0, reset: 0 };
   saveAll();
   res.json({ ok: true, message: "Đã reset toàn bộ dữ liệu" });
 });
 
 app.listen(PORT, () =>
-  console.log(chalk.green(`🚀 HYBRIDPLUS v25 (Deep Ensemble) chạy tại http://0.0.0.0:${PORT}`))
+  console.log(chalk.green(`🚀 HYBRIDPLUS v25.1 (Stable) chạy tại http://0.0.0.0:${PORT}`))
 );
