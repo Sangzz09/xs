@@ -1,4 +1,4 @@
-// HYBRIDPLUS v25.3.1 — Stable rebuild
+// HYBRIDPLUS v25.3.2 — SyncFix Stable (Full)
 // Dev: @minhsangdangcap — Rewritten: assistant
 // Node 16+ compatible
 
@@ -30,7 +30,9 @@ const SAFE_SAVE_TMP = true;
 // ---------- State ----------
 let data = {
   history: [],                    // newest-first
-  lastPredict: null,              // pending prediction for next phien
+  pendingPredictions: {},         // map predictPhien -> prediction object
+  lastPredict: null,              // convenience pointer to latest pending prediction
+  lastPhienSeen: 0,               // highest phien we've processed
   streakLose: 0,
   streakWin: 0,
   weights: { pattern: 0.25, trend: 0.25, dice: 0.2, momentum: 0.15, memory: 0.15 },
@@ -67,6 +69,7 @@ function loadAll(){
       Object.assign(data, raw);
       if(!data.weights) data.weights = { pattern:0.25,trend:0.25,dice:0.2,momentum:0.15,memory:0.15 };
       if(!Array.isArray(data.prediction_history)) data.prediction_history = [];
+      if(!data.pendingPredictions) data.pendingPredictions = {};
     }
     if(fs.existsSync(STATS_FILE)) stats = JSON.parse(fs.readFileSync(STATS_FILE,'utf8'));
   }catch(e){ console.error('loadAll err', e.message); }
@@ -93,6 +96,13 @@ function normalizeWeights(w){
   const sum = Object.values(w).reduce((a,b)=>a+b,0) || 1;
   keys.forEach(k=> w[k] = w[k]/sum);
   return w;
+}
+
+function bestPending(){
+  const keys = Object.keys(data.pendingPredictions).map(k=>parseInt(k,10)).filter(n=>!isNaN(n));
+  if(keys.length===0) return null;
+  const max = Math.max(...keys);
+  return data.pendingPredictions[max];
 }
 
 // ---------- predictor (ensemble) ----------
@@ -155,7 +165,7 @@ function simpleTune(){
       const trial = Object.assign({}, data.weights);
       trial[k] = Math.max(MIN_WEIGHT, Math.min(0.9, trial[k] * (1 + dir * TUNE_STEP)));
       normalizeWeights(trial);
-      // evaluate trial on labeled set using stored snapshots if available
+      // evaluate trial on labeled set using stored snapshots
       let tot = 0, correct = 0;
       for(const rec of labeled){
         if(!rec.snapshot) continue; // to be able to tune, we require snapshot per prediction
@@ -179,25 +189,34 @@ function simpleTune(){
   if(improved) saveAll();
 }
 
-// ---------- processing incoming item ----------
+// ---------- processing incoming item (SYNC-FIX logic) ----------
 async function processIncoming(item){
-  const lastPhien = data.history[0]?.phien;
-  if(lastPhien && item.phien <= lastPhien) return; // ignore duplicates or older
+  const lastPhien = data.history[0]?.phien || 0;
+  if(lastPhien && item.phien <= lastPhien) {
+    // duplicate or older item — ignore
+    console.log(chalk.gray(`Ignored phien ${item.phien} (<= lastPhien ${lastPhien})`));
+    return;
+  }
 
   // insert newest-first
   data.history.unshift(item);
   if(data.history.length > MAX_HISTORY) data.history = data.history.slice(0, MAX_HISTORY);
 
-  // If there was a pending prediction targeted at this phien, finalize it
-  if(data.lastPredict && data.lastPredict.predictPhien === item.phien){
-    const predRec = data.lastPredict;
+  // update lastPhienSeen
+  if(item.phien > (data.lastPhienSeen||0)) data.lastPhienSeen = item.phien;
+
+  // finalize any pending prediction that targeted THIS phien
+  const target = data.pendingPredictions[item.phien];
+  if(target){
+    const predRec = target;
     const correct = predRec.du_doan === item.ket_qua;
+    // finalize only if not abstain
     if(!predRec.abstain){
       stats.tong = (stats.tong||0) + 1;
       if(correct){ stats.dung = (stats.dung||0) + 1; data.streakWin = (data.streakWin||0) + 1; data.streakLose = 0; }
       else { stats.sai = (stats.sai||0) + 1; data.streakLose = (data.streakLose||0) + 1; data.streakWin = 0; }
     }
-    // find and update history entry in prediction_history
+    // update prediction_history matching record
     const entry = data.prediction_history.find(p=>p.predictPhien === predRec.predictPhien && typeof p.actualPhien === 'undefined');
     if(entry){
       entry.actualPhien = item.phien;
@@ -206,12 +225,19 @@ async function processIncoming(item){
       entry.tsActual = now();
     }
 
-    // try online tuning if we have enough labeled
+    // logging
+    console.log(chalk.green(`✅ Finalized predictPhien ${predRec.predictPhien}: predicted ${predRec.du_doan} (${Math.round(predRec.confidence*100)}%) — actual ${item.ket_qua} => ${correct? 'CORRECT':'WRONG'}`));
+
+    // remove from pending
+    delete data.pendingPredictions[item.phien];
+    data.lastPredict = bestPending();
+
+    // attempt tuning based on recent labelled
     const labeled = recentLabeled(TUNE_WINDOW);
     if(labeled.length >= 8){
       const acc = computeAccuracy(labeled);
       if(acc < 0.55){
-        // quick random nudge (small) to escape local minima
+        // quick random nudge (small)
         const keys = Object.keys(data.weights);
         const k = keys[Math.floor(Math.random()*keys.length)];
         const old = data.weights[k];
@@ -221,9 +247,35 @@ async function processIncoming(item){
         console.log(chalk.yellow(`⚙️ Auto-nudge weight ${k} -> ${data.weights[k].toFixed(3)} (acc ${Math.round(acc*100)}%)`));
         saveAll();
       }else{
-        // attempt structured tuning using snapshots
         simpleTune();
       }
+    }
+  } else {
+    // no pending prediction for this phien — possible reasons:
+    // - we didn't predict that phien (e.g. bot started late)
+    // - pending prediction was lost/deleted
+    // In these cases, do NOT mark any existing pending as wrong. Instead, we log and continue.
+    console.log(chalk.gray(`No pending prediction for phien ${item.phien} — possibly started late or prediction missing.`));
+
+    // If there are pending predictions with predictPhien < item.phien, they are missed (expired)
+    const expired = Object.keys(data.pendingPredictions).map(k=>parseInt(k,10)).filter(n=> !isNaN(n) && n < item.phien);
+    if(expired.length>0){
+      expired.sort((a,b)=>a-b);
+      for(const ph of expired){
+        const rec = data.pendingPredictions[ph];
+        // mark as missed: do not count as wrong (we couldn't observe actual for that prediction)
+        const histEntry = data.prediction_history.find(p=>p.predictPhien === ph && typeof p.actualPhien === 'undefined');
+        if(histEntry){
+          histEntry.actualPhien = null;
+          histEntry.actual = null;
+          histEntry.correct = null; // unknown
+          histEntry.tsActual = now();
+        }
+        console.log(chalk.yellow(`⏳ Pending predictPhien ${ph} expired (no actual matched). Marked unknown.`));
+        delete data.pendingPredictions[ph];
+      }
+      data.lastPredict = bestPending();
+      saveAll();
     }
   }
 
@@ -231,62 +283,68 @@ async function processIncoming(item){
   if((data.streakLose||0) >= 3){
     const nowTs = now();
     if(nowTs - lastResetAt > 10*60*1000){ // allow once per 10 minutes
-      console.log(chalk.yellow('♻ Sai 3 lần → shrink pattern còn 5 phiên (stats giữ nguyên)'));
-      data.history = data.history.slice(0,5);
-      data.streakLose = 0;
-      stats.reset = (stats.reset||0) + 1;
-      data.lastPredict = null;
-      lastResetAt = nowTs;
-      saveAll();
-      return;
+      // only shrink if recent predictions had decent confidence (avoid shrinking due to abstain decisions)
+      const recent = data.prediction_history.slice(-6).filter(p=>typeof p.correct === 'boolean');
+      const recentAcc = computeAccuracy(recent) || 0;
+      if(recentAcc < 0.5){
+        console.log(chalk.yellow('♻ Sai 3 lần → shrink pattern còn 5 phiên (stats giữ nguyên)'));
+        data.history = data.history.slice(0,5);
+        data.streakLose = 0;
+        stats.reset = (stats.reset||0) + 1;
+        data.pendingPredictions = {};
+        data.lastPredict = null;
+        lastResetAt = nowTs;
+        saveAll();
+        return;
+      }
     }
   }
 
-  // create/refresh prediction for next phien
+  // create new prediction for nextPhien if we don't already have one
   const nextPhien = item.phien + 1;
-  if(data.lastPredict && data.lastPredict.predictPhien === nextPhien){
-    // update metadata
-    data.lastPredict.last_phien = item.phien;
-    data.lastPredict.last_ket_qua = item.ket_qua;
-    data.lastPredict.tong = item.tong_xuc_xac;
-    data.lastPredict.xuc_xac = item.xuc_xac;
+  if(!data.pendingPredictions[nextPhien]){
+    const snapshot = JSON.parse(JSON.stringify(data.history.slice(0, 100))); // newest-first snapshot
+    const ai = hybridEnsemblePredict(data.history, data.weights);
+    const abstain = ABSTAIN_MODE && ai.confidence < ABSTAIN_THRESHOLD;
+    const predictObj = {
+      predictPhien: nextPhien,
+      du_doan: abstain ? 'Không chắc' : ai.du_doan,
+      confidence: ai.confidence,
+      abstain: !!abstain,
+      patternSeq: ai.patternSeq,
+      patternType: ai.patternType,
+      raw: ai.raw,
+      components: ai.components,
+      last_phien: item.phien,
+      last_ket_qua: item.ket_qua,
+      tong: item.tong_xuc_xac,
+      xuc_xac: item.xuc_xac,
+      createdAt: now()
+    };
+
+    data.pendingPredictions[nextPhien] = predictObj;
+    data.lastPredict = bestPending();
+    data.prediction_history.push({
+      predictPhien: predictObj.predictPhien,
+      du_doan: predictObj.du_doan,
+      confidence: predictObj.confidence,
+      abstain: predictObj.abstain,
+      snapshot: snapshot, // store to enable offline tuning
+      createdAt: predictObj.createdAt
+    });
+
+    if(!abstain) stats.tong = (stats.tong||0) + 1;
     saveAll();
-    return;
+    console.log(chalk.cyan(`🔮 Predicted Phien ${nextPhien}: ${predictObj.du_doan} (${Math.round(predictObj.confidence*100)}%) ${predictObj.abstain?"(ABSTAIN)":""}`));
+  } else {
+    // refresh metadata for existing prediction
+    const exist = data.pendingPredictions[nextPhien];
+    exist.last_phien = item.phien;
+    exist.last_ket_qua = item.ket_qua;
+    exist.tong = item.tong_xuc_xac;
+    exist.xuc_xac = item.xuc_xac;
+    saveAll();
   }
-
-  // generate new prediction — store snapshot for later tuning
-  const snapshot = JSON.parse(JSON.stringify(data.history.slice(0, 100))); // newest-first snapshot (keeps memory small)
-  const ai = hybridEnsemblePredict(data.history, data.weights);
-  const abstain = ABSTAIN_MODE && ai.confidence < ABSTAIN_THRESHOLD;
-  const predictObj = {
-    predictPhien: nextPhien,
-    du_doan: abstain ? 'Không chắc' : ai.du_doan,
-    confidence: ai.confidence,
-    abstain: !!abstain,
-    patternSeq: ai.patternSeq,
-    patternType: ai.patternType,
-    raw: ai.raw,
-    components: ai.components,
-    last_phien: item.phien,
-    last_ket_qua: item.ket_qua,
-    tong: item.tong_xuc_xac,
-    xuc_xac: item.xuc_xac,
-    createdAt: now()
-  };
-
-  data.lastPredict = predictObj;
-  data.prediction_history.push({
-    predictPhien: predictObj.predictPhien,
-    du_doan: predictObj.du_doan,
-    confidence: predictObj.confidence,
-    abstain: predictObj.abstain,
-    snapshot: snapshot, // store to enable offline tuning
-    createdAt: predictObj.createdAt
-  });
-
-  if(!abstain) stats.tong = (stats.tong||0) + 1;
-  saveAll();
-  console.log(chalk.cyan(`🔮 Phiên ${nextPhien}: ${predictObj.du_doan} (${Math.round(predictObj.confidence*100)}%) ${predictObj.abstain?"(ABSTAIN)":""}`));
 }
 
 // ---------- import loop with backoff ----------
@@ -296,7 +354,7 @@ async function importAndPredict(){
     failCount++;
     if(failCount < 6) return;
     // if failing repeatedly, log once every minute
-    if(failCount % 6 === 0) console.warn(chalk.red('⛔ Lỗi fetch API liên tục — kiểm tra API_HISTORY')); 
+    if(failCount % 6 === 0) console.warn(chalk.red('⛔ Lỗi fetch API liên tục — kiểm tra API_HISTORY'));
     return;
   }
   failCount = 0;
@@ -307,8 +365,8 @@ importAndPredict();
 
 // ---------- API endpoints ----------
 app.get('/sunwinapi', (req,res)=>{
-  if(!data.lastPredict) return res.json({message:'Chưa có dữ liệu'});
-  const p = data.lastPredict;
+  const p = data.lastPredict || bestPending();
+  if(!p) return res.json({message:'Chưa có dữ liệu'});
   res.json({
     Phien: p.last_phien || null,
     Ket_qua: p.last_ket_qua || null,
@@ -318,7 +376,7 @@ app.get('/sunwinapi', (req,res)=>{
     Confidence: `${Math.round(p.confidence*100)}%`,
     Pattern: p.patternSeq,
     Loai_cau: p.patternType,
-    Thuat_toan: 'HYBRID+ DEEP_ENSEMBLE_V25.3.1',
+    Thuat_toan: 'HYBRID+ DEEP_ENSEMBLE_V25.3.2',
     So_lan_du_doan: stats.tong || 0,
     So_dung: stats.dung || 0,
     So_sai: stats.sai || 0,
@@ -372,27 +430,30 @@ app.get('/diagnostics', (req,res)=>{
   res.json({
     weights: data.weights,
     lastPredict: data.lastPredict,
+    pendingCount: Object.keys(data.pendingPredictions).length,
     rolling_accuracy: Math.round(acc*10000)/100,
     labeled_count: labeled.length,
     failCount,
     streakWin: data.streakWin,
-    streakLose: data.streakLose
+    streakLose: data.streakLose,
+    lastPhienSeen: data.lastPhienSeen
   });
 });
 
 app.get('/resetpattern', (req,res)=>{
   data.history = data.history.slice(0,5);
   data.streakLose = 0; data.streakWin = 0;
+  data.pendingPredictions = {};
   stats.reset = (stats.reset||0)+1;
   saveAll();
   res.json({ok:true, message:'reset pattern (stats giữ)'});
 });
 
 app.get('/resetall', (req,res)=>{
-  data = { history:[], lastPredict:null, streakLose:0, streakWin:0, weights:{pattern:0.25,trend:0.25,dice:0.2,momentum:0.15,memory:0.15}, prediction_history:[] };
+  data = { history:[], pendingPredictions:{}, lastPredict:null, lastPhienSeen:0, streakLose:0, streakWin:0, weights:{pattern:0.25,trend:0.25,dice:0.2,momentum:0.15,memory:0.15}, prediction_history:[] };
   stats = { tong:0, dung:0, sai:0, reset:0 };
   saveAll();
   res.json({ok:true, message:'reset all'});
 });
 
-app.listen(PORT, ()=> console.log(chalk.green(`🚀 HYBRIDPLUS v25.3.1 chạy tại http://0.0.0.0:${PORT}`)));
+app.listen(PORT, ()=> console.log(chalk.green(`🚀 HYBRIDPLUS v25.3.2 chạy tại http://0.0.0.0:${PORT}`)));
