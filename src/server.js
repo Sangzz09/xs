@@ -1,10 +1,10 @@
-// HYBRIDPLUS v25.5 - Full Stable (StatSync + Hybrid Ensemble)
+// HYBRIDPLUS v26.0 - Deep Ensemble + Pattern Memory (upgrade from v25.5)
 // Author: @minhsangdangcap (assistant adapted)
 // Node.js 16+ (CommonJS). Dependencies: express, axios, chalk
 //
-// Save as: hybridplus_v25.5_full.js
+// Save as: hybridplus_v26.0.js
 // Install: npm install express axios chalk
-// Run:    node hybridplus_v25.5_full.js
+// Run:    node hybridplus_v26.0.js
 // --------------------------------------------------------
 
 const fs = require('fs');
@@ -128,20 +128,71 @@ function normalizeWeights(w){
   return w;
 }
 
-function hybridEnsemblePredict(history, weights){
-  const seq = seqTX(history,30);
+// ============ NEW: Deep Fusion Predict (v26.0) ============
+function hybridEnsemblePredict(history, weights) {
+  // If not enough data, fallback to simple heuristic
+  if (!history || history.length < 5) {
+    return { du_doan: 'Tài', confidence: 0.55, patternSeq: seqTX(history||[],30), patternType: 'none', raw: 0, components: {} };
+  }
+
+  // base components
+  const seq = seqTX(history, 40); // longer window for pattern memory
   const pat = analyzePattern(seq);
-  const t = getTrend(history,6);
+  const trend = getTrend(history, 8);
   const dice = diceBias(history[0]);
   const mom = momentum(history);
   const mem = memoryPattern(history);
+
+  // recent rates
+  const last15 = history.slice(0, 15);
+  const taiRate = (last15.filter(h => (h.ket_qua === 'Tài' || h.ket_qua === 'T')).length) / (last15.length || 1);
+  const xiuRate = 1 - taiRate;
+
+  // Pattern Memory Matrix: count repeats of last-8 pattern in past window
+  let patternScore = 0;
+  const memSeqs = [];
+  for (let i = 8; i < Math.min(80, history.length - 8); i++) {
+    const part = seqTX(history.slice(i), 8);
+    memSeqs.push(part);
+  }
+  const lastSeq = seqTX(history, 8);
+  const matchCount = memSeqs.filter(s => s === lastSeq).length;
+  if (matchCount > 1) {
+    // logarithmic boost for repeated patterns (keeps effect bounded)
+    patternScore = 0.35 * (lastSeq.endsWith('T') ? 1 : -1) * Math.log2(matchCount + 1);
+  }
+
+  // Adaptive trend correction based on streaks
+  const adaptiveTrend = trend * (1 + (data.streakLose > 1 ? 0.3 : 0) - (data.streakWin > 2 ? 0.25 : 0));
+
+  // fusion using normalized weights
   const w = normalizeWeights(Object.assign({}, weights || data.weights));
-  let raw = pat.score * w.pattern + t * w.trend + dice * w.dice + mom * w.momentum + mem * w.memory;
-  const avg = history.slice(0,8).reduce((a,b)=>a+(b.tong_xuc_xac||0),0)/(Math.min(8,history.length)||1);
-  raw += (avg - 10.5) * 0.04;
+  let raw = pat.score * w.pattern
+          + adaptiveTrend * w.trend
+          + dice * w.dice
+          + mom * w.momentum
+          + mem * w.memory
+          + patternScore * 0.25;
+
+  // bias from recent outcome rates (if recent has strong skew, reflect it)
+  raw += (taiRate - xiuRate) * 0.28;
+
+  // confidence calculation
+  const confidenceBase = 0.55 + Math.min(0.4, Math.abs(raw) * 0.5);
+  const confidence = Math.min(0.99, Math.max(0.52, confidenceBase));
+
+  // decision
   const du_doan = raw >= 0 ? 'Tài' : 'Xỉu';
-  const confidence = Math.min(0.97, 0.55 + Math.abs(raw) * 0.45 + Math.min(0.15, Math.abs(pat.score) * 0.15));
-  return {du_doan,confidence,patternSeq:seq,patternType:pat.type,raw,components:{pat:pat.score,trend:t,dice,mom,mem}};
+  const components = { pattern: pat.score, trend: adaptiveTrend, dice, momentum: mom, memory: mem, patternScore, taiRate, xiuRate };
+
+  return {
+    du_doan,
+    confidence,
+    patternSeq: seq,
+    patternType: pat.type,
+    raw,
+    components
+  };
 }
 
 // ============ Fetch API (single robust impl) ============
@@ -392,7 +443,7 @@ app.get('/sunwinapi', (req,res)=>{
     Confidence: `${Math.round(p.confidence*100)}%`,
     Pattern: p.patternSeq,
     Loai_cau: p.patternType,
-    Thuat_toan: 'HYBRID+ DEEP_ENSEMBLE_V25.5',
+    Thuat_toan: 'HYBRID+ DEEP_ENSEMBLE_V26.0',
     So_lan_du_doan: stats.So_lan_du_doan || 0,
     So_dung: stats.So_dung || 0,
     So_sai: stats.So_sai || 0,
@@ -472,4 +523,4 @@ app.get('/resetall', (req,res)=>{
 });
 
 // ============ Start server ============
-app.listen(PORT, ()=> console.log(chalk.green(`🚀 HYBRIDPLUS v25.5 running at http://0.0.0.0:${PORT}`)));
+app.listen(PORT, ()=> console.log(chalk.green(`🚀 HYBRIDPLUS v26.0 running at http://0.0.0.0:${PORT}`)));
