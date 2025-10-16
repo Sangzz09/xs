@@ -1,10 +1,11 @@
 // HYBRIDPLUS v26.1 - Day-Aware Deep Ensemble + Pattern Memory
-// Upgrade from v26.0: fix predictPhien alignment, daily stats, algo improvements
+// Fix: predictPhien vs actualPhien alignment (match pendingPredictions[item.phien])
 // Node.js 16+ (CommonJS). Dependencies: express, axios, chalk
 //
 // Save as: hybridplus_v26.1.js
 // Install: npm install express axios chalk
 // Run:    node hybridplus_v26.1.js
+// Optional debug: DEBUG_PENDING=true node hybridplus_v26.1.js
 // --------------------------------------------------------
 
 const fs = require('fs');
@@ -339,12 +340,22 @@ async function processIncoming(item) {
   if (item.phien > (data.lastPhienSeen || 0)) data.lastPhienSeen = item.phien;
 
   // finalize pending prediction for this phien
-  // **FIX**: match prediction created for phien X (predictPhien === X) which was created at previous phien (X-1)
-  const target = data.pendingPredictions[item.phien - 1];
+  // CORRECT LOGIC: when we created the prediction earlier we stored it as data.pendingPredictions[nextPhien]
+  // where nextPhien = previousItem.phien + 1. The actual result for phien X should be matched to
+  // pendingPredictions[X]. So lookup by item.phien.
+  const target = data.pendingPredictions[item.phien];
+
+  // debug: show pending keys for tracing (helpful when troubleshooting)
+  if (process.env.DEBUG_PENDING === 'true') {
+    console.log(chalk.gray('Pending keys:', Object.keys(data.pendingPredictions).sort((a,b)=>a-b).join(',')));
+    console.log(chalk.gray('Incoming phien:', item.phien));
+  }
+
   if (target) {
     const predRec = target;
     // Normalize both sides before compare
-    const actual = normalizeResult(item.ket_qua || item.ket_qua || item.ketqua || item.ketQua || item.Ket_qua || item.KET_QUA) || normalizeResult(item.tong_xuc_xac || item.tong || item.Tong);
+    const actual = normalizeResult(item.ket_qua || item.ket_qua || item.ketqua || item.ketQua || item.Ket_qua || item.KET_QUA)
+                   || normalizeResult(item.tong_xuc_xac || item.tong || item.Tong);
     const predicted = normalizeResult(predRec.du_doan);
     const correct = (predicted && actual) ? (predicted === actual) : null;
 
@@ -365,7 +376,6 @@ async function processIncoming(item) {
         data.streakLose = (data.streakLose || 0) + 1;
         data.streakWin = 0;
       } else {
-        // unknown (can't decide), do not increment counters
         console.log(chalk.yellow(`⚠️ Unable to determine correct/incorrect for phien ${item.phien} (pred='${predRec.du_doan}' actual='${item.ket_qua}')`));
       }
     }
@@ -380,17 +390,18 @@ async function processIncoming(item) {
     }
 
     console.log(chalk.green(`✅ Finalized ${predRec.predictPhien}: predicted ${predRec.du_doan} (${Math.round(predRec.confidence * 100)}%) -> actual ${item.ket_qua} => ${correct === true ? 'CORRECT' : (correct === false ? 'WRONG' : 'UNKNOWN')}`));
-    delete data.pendingPredictions[item.phien - 1];
+
+    // remove the pending entry for item.phien
+    delete data.pendingPredictions[item.phien];
 
     rotateDailyStatsIfNeeded();
     saveAllDebounced();
 
-    // tuning
+    // tuning logic (unchanged)
     const labeled = recentLabeled(TUNE_WINDOW);
     if (labeled.length >= 8) {
       const acc = computeAccuracy(labeled);
       if (acc !== null && acc < 0.55) {
-        // random nudge to escape local minima
         const keys = Object.keys(data.weights);
         const k = keys[Math.floor(Math.random() * keys.length)];
         const old = data.weights[k];
@@ -404,7 +415,8 @@ async function processIncoming(item) {
       }
     }
   } else {
-    console.log(chalk.gray(`No pending prediction matched for phien ${item.phien} (may have started late)`));
+    // no matching pending prediction found for this phien
+    console.log(chalk.gray(`No pending prediction matched for phien ${item.phien}`));
     // expire older pending predictions
     const expired = Object.keys(data.pendingPredictions).map(k => parseInt(k, 10)).filter(n => !isNaN(n) && n < item.phien);
     if (expired.length) {
@@ -452,7 +464,8 @@ async function processIncoming(item) {
     const abstain = ABSTAIN_MODE && ai.confidence < ABSTAIN_THRESHOLD;
     const predictObj = {
       predictPhien: nextPhien,
-      du_doan: abstain ? 'Không chắc' : ai.du_doan,
+      du_doan: abstain ? 'Không chắc' : ai.du_do_an || ai.du_doan || ai.du_doan, // defensive
+      du_doan_alt: ai.du_doan,
       confidence: ai.confidence,
       abstain: !!abstain,
       patternSeq: ai.patternSeq,
