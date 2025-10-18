@@ -1,13 +1,13 @@
 // server.js
-// Project: botrumsunwinapi (v4.0 - persistent state + auto-reset mỗi 15 phiên)
+// Project: botrumsunwinapi v5.0 (Tiếng Việt + loại cầu + auto reset)
 // Endpoint: /sunwinapi
-// Nguồn dữ liệu: https://hackvn.xyz/apisun.php
+// Author: @minhsangdangcap
 
-const express = require('express');
-const axios = require('axios');
-const cors = require('cors');
-const fs = require('fs').promises;
-const path = require('path');
+const express = require("express");
+const axios = require("axios");
+const cors = require("cors");
+const fs = require("fs").promises;
+const path = require("path");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -15,301 +15,256 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-const SOURCE_API = 'https://hackvn.xyz/apisun.php';
-const DATA_FILE = path.join(__dirname, 'data.json'); // file lưu trạng thái
+const SOURCE_API = "https://hackvn.xyz/apisun.php";
+const DATA_FILE = path.join(__dirname, "data.json");
 
-// ======= State in-memory (will persist to DATA_FILE) =======
-let history = []; // mỗi phần tử: { phien, result, predicted, thuat_toan, correct (true/false/null), correctChecked (bool), xuc_xac, tong, timestamp }
-let correctCount = 0;
-let incorrectCount = 0;
-let processedSinceReset = 0; // tăng khi thêm phiên; nếu >=15 -> reset (giữ 5)
-const AUTO_RESET_THRESHOLD = 15;
-const KEEP_AFTER_RESET = 5;
-let lastSavedAt = 0;
+// ================== BIẾN LƯU TRẠNG THÁI ==================
+let lichSu = []; // mỗi phần tử: { phien, ket_qua, du_doan, thuat_toan, loai_cau, dung_sai, xuc_xac, tong }
+let soLanDung = 0;
+let soLanSai = 0;
+let demPhien = 0;
+const NGUONG_RESET = 15;
+const GIU_LAI = 5;
 
-// ======= Helpers =======
-function safeLast(arr, n) {
-  if (!Array.isArray(arr) || arr.length === 0) return [];
+// ================== HÀM HỖ TRỢ ==================
+function layCuoi(arr, n) {
   return arr.slice(-n);
 }
-function countIn(arr, val) {
-  return arr.filter(x => x === val).length;
+
+async function luuTrangThai() {
+  const duLieu = {
+    lichSu,
+    soLanDung,
+    soLanSai,
+    demPhien,
+  };
+  await fs.writeFile(DATA_FILE, JSON.stringify(duLieu, null, 2), "utf8");
 }
 
-// ======= Persistence =======
-async function loadState() {
+async function taiTrangThai() {
   try {
-    const raw = await fs.readFile(DATA_FILE, 'utf8');
-    const obj = JSON.parse(raw);
-    history = obj.history || [];
-    correctCount = obj.correctCount || 0;
-    incorrectCount = obj.incorrectCount || 0;
-    processedSinceReset = obj.processedSinceReset || 0;
-    console.log('🟢 State loaded from', DATA_FILE);
-  } catch (err) {
-    // nếu file không tồn tại thì bắt đầu từ state rỗng
-    console.log('ℹ️ No saved state found, starting fresh.');
-    history = [];
-    correctCount = 0;
-    incorrectCount = 0;
-    processedSinceReset = 0;
+    const raw = await fs.readFile(DATA_FILE, "utf8");
+    const data = JSON.parse(raw);
+    lichSu = data.lichSu || [];
+    soLanDung = data.soLanDung || 0;
+    soLanSai = data.soLanSai || 0;
+    demPhien = data.demPhien || 0;
+    console.log("🟢 Đã tải dữ liệu từ data.json");
+  } catch {
+    console.log("ℹ️ Bắt đầu mới, chưa có file data.json");
   }
 }
 
-async function saveState() {
-  try {
-    const obj = {
-      history,
-      correctCount,
-      incorrectCount,
-      processedSinceReset,
-      savedAt: Date.now()
+// ================== CÁC LOẠI CẦU / THUẬT TOÁN ==================
+function duDoanCau(lichSu) {
+  const n = lichSu.length;
+  const ketQua = lichSu.map((h) => h.ket_qua);
+  const cuoi3 = layCuoi(ketQua, 3);
+  const cuoi4 = layCuoi(ketQua, 4);
+  const cuoi5 = layCuoi(ketQua, 5);
+  const cuoi6 = layCuoi(ketQua, 6);
+  const cuoi10 = layCuoi(ketQua, 10);
+  const cuoi15 = layCuoi(ketQua, 15);
+
+  // 🧩 1. Cầu bệt >=5
+  if (cuoi5.length === 5 && cuoi5.every((r) => r === cuoi5[0])) {
+    return {
+      du_doan: cuoi5[0] === "Tài" ? "Xỉu" : "Tài",
+      thuat_toan: "Đảo sau bệt 5",
+      loai_cau: "Cầu bệt",
     };
-    await fs.writeFile(DATA_FILE, JSON.stringify(obj, null, 2), 'utf8');
-    lastSavedAt = Date.now();
-    // console.log('💾 State saved to', DATA_FILE);
-  } catch (err) {
-    console.error('❌ Lỗi khi lưu state:', err.message);
   }
+
+  // 🌀 2. Cầu xen kẽ
+  if (cuoi4.length === 4 && cuoi4.every((v, i, arr) => i === 0 || v !== arr[i - 1])) {
+    return {
+      du_doan: cuoi4[3] === "Tài" ? "Xỉu" : "Tài",
+      thuat_toan: "Đảo sau xen kẽ",
+      loai_cau: "Cầu xen kẽ",
+    };
+  }
+
+  // ⚖️ 3. Cầu cân bằng 10
+  const tai10 = cuoi10.filter((r) => r === "Tài").length;
+  if (tai10 >= 8)
+    return { du_doan: "Xỉu", thuat_toan: "Cân bằng 10", loai_cau: "Cầu cân bằng" };
+  if (cuoi10.length - tai10 >= 8)
+    return { du_doan: "Tài", thuat_toan: "Cân bằng 10", loai_cau: "Cầu cân bằng" };
+
+  // 📈 4. Cầu trend 3/4
+  const tai4 = cuoi4.filter((r) => r === "Tài").length;
+  if (tai4 >= 3)
+    return { du_doan: "Tài", thuat_toan: "Trend 3/4", loai_cau: "Cầu xu hướng" };
+  if (tai4 <= 1)
+    return { du_doan: "Xỉu", thuat_toan: "Trend 3/4", loai_cau: "Cầu xu hướng" };
+
+  // 🔁 5. Cặp đôi TTXX
+  if (
+    cuoi4.length === 4 &&
+    cuoi4[0] === cuoi4[1] &&
+    cuoi4[2] === cuoi4[3] &&
+    cuoi4[0] !== cuoi4[2]
+  ) {
+    return { du_doan: cuoi4[2], thuat_toan: "Cặp đôi TT|XX", loai_cau: "Cầu cặp đôi" };
+  }
+
+  // 🔄 6. Đảo sau 3 cùng
+  if (cuoi3.length === 3 && cuoi3.every((r) => r === cuoi3[0])) {
+    return {
+      du_doan: cuoi3[0] === "Tài" ? "Xỉu" : "Tài",
+      thuat_toan: "Đảo sau 3 cùng",
+      loai_cau: "Cầu đảo",
+    };
+  }
+
+  // 🔂 7. Chu kỳ 6
+  if (cuoi6.length === 6) {
+    const dau3 = cuoi6.slice(0, 3).join("");
+    const sau3 = cuoi6.slice(3).join("");
+    if (dau3 === sau3) {
+      return {
+        du_doan: cuoi6[0],
+        thuat_toan: "Chu kỳ 6",
+        loai_cau: "Cầu chu kỳ",
+      };
+    }
+  }
+
+  // 🧮 8. Markov cơ bản
+  if (n >= 10) {
+    let taiToXiu = 0,
+      taiToTai = 0,
+      xiuToTai = 0,
+      xiuToXiu = 0;
+    for (let i = 1; i < n; i++) {
+      const prev = ketQua[i - 1];
+      const curr = ketQua[i];
+      if (prev === "Tài") curr === "Xỉu" ? taiToXiu++ : taiToTai++;
+      else curr === "Tài" ? xiuToTai++ : xiuToXiu++;
+    }
+    const last = ketQua[n - 1];
+    if (last === "Tài")
+      return {
+        du_doan: taiToXiu > taiToTai ? "Xỉu" : "Tài",
+        thuat_toan: "Markov (Tài→?)",
+        loai_cau: "Cầu xác suất",
+      };
+    else
+      return {
+        du_doan: xiuToTai > xiuToXiu ? "Tài" : "Xỉu",
+        thuat_toan: "Markov (Xỉu→?)",
+        loai_cau: "Cầu xác suất",
+      };
+  }
+
+  // 📊 9. Lệch chuẩn 15
+  if (cuoi15.length === 15) {
+    const tai15 = cuoi15.filter((r) => r === "Tài").length;
+    const lech = tai15 / 15;
+    if (lech >= 0.75)
+      return {
+        du_doan: "Xỉu",
+        thuat_toan: "Lệch chuẩn 15 (Tài nhiều)",
+        loai_cau: "Cầu lệch chuẩn",
+      };
+    if (lech <= 0.25)
+      return {
+        du_doan: "Tài",
+        thuat_toan: "Lệch chuẩn 15 (Xỉu nhiều)",
+        loai_cau: "Cầu lệch chuẩn",
+      };
+  }
+
+  // ⚙️ 10. Dự đoán mặc định
+  const tai5 = cuoi5.filter((r) => r === "Tài").length;
+  return {
+    du_doan: tai5 >= 3 ? "Tài" : "Xỉu",
+    thuat_toan: "Đa số 5",
+    loai_cau: "Cầu thống kê",
+  };
 }
 
-// ======= Thuật toán dự đoán (tập hợp "cầu") =======
-function predictAdvanced(hist) {
-  const n = Array.isArray(hist) ? hist.length : 0;
-  if (n < 3) {
-    return { du_doan: Math.random() > 0.5 ? 'Tài' : 'Xỉu', thuat_toan: 'Ngẫu nhiên (ít dữ liệu)', confidence: 0.45 };
-  }
-
-  const results = hist.map(h => h.result);
-  const last2 = safeLast(results, 2);
-  const last3 = safeLast(results, 3);
-  const last4 = safeLast(results, 4);
-  const last5 = safeLast(results, 5);
-  const last6 = safeLast(results, 6);
-  const last10 = safeLast(results, 10);
-  const last15 = safeLast(results, 15);
-
-  // 1) Cầu bệt >=5 -> đảo
-  if (last5.length >= 5 && last5.every(r => r === last5[0])) {
-    return { du_doan: last5[0] === 'Tài' ? 'Xỉu' : 'Tài', thuat_toan: 'Cầu bệt (>=5) -> Đảo', confidence: 0.85 };
-  }
-
-  // 2) Xen kẽ trong 4 -> đảo
-  if (last4.length >= 4) {
-    let isAlt = true;
-    for (let i = 1; i < last4.length; i++) {
-      if (last4[i] === last4[i - 1]) { isAlt = false; break; }
-    }
-    if (isAlt) {
-      return { du_doan: last4[last4.length - 1] === 'Tài' ? 'Xỉu' : 'Tài', thuat_toan: 'Cầu xen kẽ', confidence: 0.75 };
-    }
-  }
-
-  // 3) Cặp đôi TTXX
-  if (last4.length === 4 && last4[0] === last4[1] && last4[2] === last4[3] && last4[0] !== last4[2]) {
-    return { du_doan: last4[2], thuat_toan: 'Cặp đôi TT|XX', confidence: 0.7 };
-  }
-
-  // 4) Đảo sau 3 cùng / 2 cùng
-  if (last3.length === 3 && last3.every(r => r === last3[0])) {
-    return { du_doan: last3[0] === 'Tài' ? 'Xỉu' : 'Tài', thuat_toan: 'Đảo sau 3 cùng', confidence: 0.82 };
-  }
-  if (last2.length === 2 && last2[0] === last2[1]) {
-    return { du_doan: last2[0] === 'Tài' ? 'Xỉu' : 'Tài', thuat_toan: 'Đảo sau 2 cùng', confidence: 0.65 };
-  }
-
-  // 5) Trend 3/4
-  if (last4.length >= 4) {
-    const taiIn4 = countIn(last4, 'Tài');
-    if (taiIn4 >= 3) return { du_doan: 'Tài', thuat_toan: 'Trend 3/4', confidence: 0.72 };
-    if (taiIn4 <= 1) return { du_doan: 'Xỉu', thuat_toan: 'Trend 3/4', confidence: 0.72 };
-  }
-
-  // 6) Chu kỳ 6
-  if (last6.length === 6) {
-    const first3 = last6.slice(0, 3).join('');
-    const last3Str = last6.slice(3, 6).join('');
-    if (first3 === last3Str) {
-      return { du_doan: last6[0], thuat_toan: 'Chu kỳ 6', confidence: 0.78 };
-    }
-  }
-
-  // 7) Markov (cơ bản) nếu có nhiều dữ liệu
-  if (n >= 15) {
-    let taiToXiu = 0, taiToTai = 0, xiuToTai = 0, xiuToXiu = 0;
-    for (let i = 1; i < hist.length; i++) {
-      if (hist[i - 1].result === 'Tài') {
-        if (hist[i].result === 'Xỉu') taiToXiu++; else taiToTai++;
-      } else {
-        if (hist[i].result === 'Tài') xiuToTai++; else xiuToXiu++;
-      }
-    }
-    const last = results[results.length - 1];
-    if (last === 'Tài') {
-      const pred = taiToXiu > taiToTai ? 'Xỉu' : 'Tài';
-      return { du_doan: pred, thuat_toan: 'Markov (Tài->?)', confidence: 0.6 };
-    } else {
-      const pred = xiuToTai > xiuToXiu ? 'Tài' : 'Xỉu';
-      return { du_doan: pred, thuat_toan: 'Markov (Xỉu->?)', confidence: 0.6 };
-    }
-  }
-
-  // 8) Độ lệch chuẩn 15 phiên
-  if (last15.length >= 15) {
-    const taiCount = countIn(last15, 'Tài');
-    const ratio = taiCount / 15;
-    if (ratio >= 0.75) return { du_doan: 'Xỉu', thuat_toan: 'Lệch chuẩn 15 (T nhiều) -> Đảo', confidence: 0.78 };
-    if (ratio <= 0.25) return { du_doan: 'Tài', thuat_toan: 'Lệch chuẩn 15 (X nhiều) -> Đảo', confidence: 0.78 };
-  }
-
-  // 9) Pattern TTX / XXT (dự đoán lặp lại)
-  if (last3.length === 3) {
-    if (last3[0] === 'Tài' && last3[1] === 'Tài' && last3[2] === 'Xỉu') return { du_doan: 'Tài', thuat_toan: 'Pattern TTX', confidence: 0.66 };
-    if (last3[0] === 'Xỉu' && last3[1] === 'Xỉu' && last3[2] === 'Tài') return { du_doan: 'Xỉu', thuat_toan: 'Pattern XXT', confidence: 0.66 };
-  }
-
-  // Fallback: đa số trong 5
-  const taiIn5 = countIn(last5, 'Tài');
-  return { du_doan: taiIn5 >= 3 ? 'Tài' : 'Xỉu', thuat_toan: 'Đa số 5 (fallback)', confidence: 0.55 };
-}
-
-// ======= Endpoint chính =======
-app.get('/sunwinapi', async (req, res) => {
+// ================== API CHÍNH ==================
+app.get("/sunwinapi", async (req, res) => {
   try {
-    // Lấy dữ liệu nguồn
-    const response = await axios.get(SOURCE_API, { timeout: 8000 });
-    const item = response.data;
+    const resAPI = await axios.get(SOURCE_API);
+    const data = resAPI.data;
 
-    const phien = parseInt(item.phien);
-    const x1 = parseInt(item.xuc_xac_1);
-    const x2 = parseInt(item.xuc_xac_2);
-    const x3 = parseInt(item.xuc_xac_3);
+    const phien = parseInt(data.phien);
+    const x1 = parseInt(data.xuc_xac_1);
+    const x2 = parseInt(data.xuc_xac_2);
+    const x3 = parseInt(data.xuc_xac_3);
     const tong = x1 + x2 + x3;
-    const ket_qua = (item.ket_qua || '').trim() === 'Tài' ? 'Tài' : 'Xỉu';
+    const ket_qua = data.ket_qua.trim() === "Tài" ? "Tài" : "Xỉu";
 
-    if (isNaN(phien) || isNaN(tong) || tong < 3 || tong > 18) {
-      throw new Error('Dữ liệu nguồn không hợp lệ');
-    }
+    if (isNaN(phien) || isNaN(tong)) throw new Error("Dữ liệu lỗi!");
 
-    // 1) Tạo dự đoán cho "phiên kế tiếp" dựa trên lịch sử hiện tại (chưa push kết quả mới)
-    const prediction = predictAdvanced(history);
-
-    // 2) Nếu có phiên trước trong history mà đã có predicted nhưng chưa check đúng/sai -> so sánh với kết quả hiện tại
-    if (history.length > 0) {
-      const last = history[history.length - 1];
-      // last.predicted là dự đoán đã lưu trước đó cho phiên sau nó.
-      if (last.predicted && !last.correctChecked) {
-        last.correct = (last.predicted === ket_qua);
-        last.correctChecked = true;
-        if (last.correct) correctCount++;
-        else incorrectCount++;
+    // Kiểm tra đúng/sai so với dự đoán trước
+    if (lichSu.length > 0) {
+      const truoc = lichSu[lichSu.length - 1];
+      if (truoc.du_doan && truoc.dung_sai === null) {
+        truoc.dung_sai = truoc.du_doan === ket_qua ? "Đúng" : "Sai";
+        if (truoc.dung_sai === "Đúng") soLanDung++;
+        else soLanSai++;
       }
     }
 
-    // 3) Nếu phien mới hơn so với phien cuối history thì push record mới (kèm predicted vừa tạo)
-    if (history.length === 0 || history[history.length - 1].phien !== phien) {
-      const record = {
+    // Tạo dự đoán mới
+    const duDoan = duDoanCau(lichSu);
+
+    // Cập nhật lịch sử
+    if (lichSu.length === 0 || lichSu[lichSu.length - 1].phien !== phien) {
+      lichSu.push({
         phien,
-        result: ket_qua,
-        predicted: prediction.du_doan,      // dự đoán cho phiên kế tiếp (lưu kèm)
-        thuat_toan: prediction.thuat_toan,
-        confidence: Math.round((prediction.confidence || 0) * 100) / 100,
-        correct: null,
-        correctChecked: false,
+        ket_qua,
+        du_doan: duDoan.du_doan,
+        thuat_toan: duDoan.thuat_toan,
+        loai_cau: duDoan.loai_cau,
+        dung_sai: null,
         xuc_xac: [x1, x2, x3],
         tong,
-        timestamp: Date.now()
-      };
-      history.push(record);
+      });
 
-      // tăng bộ đếm processedSinceReset
-      processedSinceReset++;
+      demPhien++;
 
-      // Nếu đạt ngưỡng reset -> giữ lại KEEP_AFTER_RESET phiên gần nhất
-      if (processedSinceReset >= AUTO_RESET_THRESHOLD) {
-        const kept = safeLast(history, KEEP_AFTER_RESET);
-        history = kept.map(h => {
-          // reset correctChecked nếu cần (giữ nguyên đúng/sai đã check nếu có)
-          return {
-            phien: h.phien,
-            result: h.result,
-            predicted: h.predicted,
-            thuat_toan: h.thuat_toan,
-            confidence: h.confidence,
-            correct: h.correct,
-            correctChecked: h.correctChecked,
-            xuc_xac: h.xuc_xac,
-            tong: h.tong,
-            timestamp: h.timestamp
-          };
-        });
-        processedSinceReset = 0;
-        console.log(`♻️ Auto-reset sau ${AUTO_RESET_THRESHOLD} phiên — giữ lại ${KEEP_AFTER_RESET} phiên gần nhất.`);
+      // Reset nếu đạt ngưỡng
+      if (demPhien >= NGUONG_RESET) {
+        lichSu = layCuoi(lichSu, GIU_LAI);
+        demPhien = 0;
+        console.log(`♻️ Reset sau ${NGUONG_RESET} phiên, giữ ${GIU_LAI} gần nhất.`);
       }
 
-      // Giữ tổng history không quá lớn (để tránh memory leak), tối đa 500
-      if (history.length > 500) history = safeLast(history, 500);
-
-      // Lưu state vào file
-      saveState().catch(err => console.error('Lỗi khi lưu state:', err.message));
+      await luuTrangThai();
     }
 
-    // Tạo pattern hiện tại (sau khi push)
-    const pattern = history.map(h => h.result === 'Tài' ? 't' : 'x').join('');
+    const pattern = lichSu.map((h) => (h.ket_qua === "Tài" ? "t" : "x")).join("");
 
     res.json({
       phien,
       ket_qua,
       xuc_xac: [x1, x2, x3],
       tong_xuc_xac: tong,
-      du_doan_ke_tiep: prediction.du_doan,
-      thuat_toan: prediction.thuat_toan,
-      confidence: Math.round((prediction.confidence || 0) * 100) / 100,
+      du_doan_tiep_theo: duDoan.du_doan,
+      loai_cau: duDoan.loai_cau,
+      thuat_toan: duDoan.thuat_toan,
+      so_lan_dung: soLanDung,
+      so_lan_sai: soLanSai,
       pattern,
-      correctCount,
-      incorrectCount,
-      history_length: history.length,
-      processedSinceReset,
-      id: "@minhsangdangcap"
+      tong_lich_su: lichSu.length,
+      id: "@minhsangdangcap",
     });
   } catch (err) {
-    console.error('❌ Lỗi khi gọi /sunwinapi:', err.message);
-    res.status(500).json({
-      phien: 0,
-      ket_qua: "Lỗi",
-      xuc_xac: [0,0,0],
-      tong_xuc_xac: 0,
-      du_doan_ke_tiep: "Lỗi",
-      thuat_toan: "Lỗi hệ thống",
-      correctCount,
-      incorrectCount,
-      history_length: history.length,
-      id: "@minhsangdangcap"
-    });
+    console.error("❌ Lỗi:", err.message);
+    res.status(500).json({ loi: "Lỗi hệ thống hoặc nguồn API" });
   }
 });
 
-// ======= Optional: endpoint trả về toàn bộ history + stats (truy vấn nội bộ) =======
-app.get('/stats', (req, res) => {
-  // Trả về summary và 20 phiên gần nhất
-  const recent = safeLast(history, 20);
-  res.json({
-    correctCount,
-    incorrectCount,
-    history_length: history.length,
-    processedSinceReset,
-    recent,
-  });
+app.get("/", (req, res) => {
+  res.json({ thong_bao: "✅ API Dự đoán SUN.WIN hoạt động", duong_dan: "/sunwinapi" });
 });
 
-app.get('/', (req, res) => {
-  res.json({ message: "✅ botrumsunwinapi - SUN.WIN (v4.0 persistent + auto-reset)", endpoint: "/sunwinapi" });
-});
-
-// ======= Start: load saved state trước khi listen =======
+// ================== KHỞI CHẠY ==================
 (async () => {
-  await loadState();
-  // lưu state ban đầu (để tạo file nếu chưa có)
-  await saveState();
+  await taiTrangThai();
   app.listen(PORT, () => console.log(`🚀 Server chạy trên cổng ${PORT}`));
 })();
