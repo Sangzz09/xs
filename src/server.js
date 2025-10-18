@@ -1,624 +1,315 @@
-// HYBRIDPLUS v26.1 - Day-Aware Deep Ensemble + Pattern Memory
-// Fix: predictPhien vs actualPhien alignment (match pendingPredictions[item.phien])
-// Node.js 16+ (CommonJS). Dependencies: express, axios, chalk
-//
-// Save as: hybridplus_v26.1.js
-// Install: npm install express axios chalk
-// Run:    node hybridplus_v26.1.js
-// Optional debug: DEBUG_PENDING=true node hybridplus_v26.1.js
-// --------------------------------------------------------
+// server.js
+// Project: botrumsunwinapi (v4.0 - persistent state + auto-reset mỗi 15 phiên)
+// Endpoint: /sunwinapi
+// Nguồn dữ liệu: https://hackvn.xyz/apisun.php
 
-const fs = require('fs');
-const path = require('path');
 const express = require('express');
 const axios = require('axios');
-const chalk = require('chalk');
+const cors = require('cors');
+const fs = require('fs').promises;
+const path = require('path');
 
 const app = express();
+const PORT = process.env.PORT || 3000;
+
+app.use(cors());
 app.use(express.json());
 
-// ============ Config ============
-const PORT = process.env.PORT || 3000;
-const API_HISTORY = process.env.API_HISTORY || 'https://hackvn.xyz/apisun.php';
-const DATA_FILE = path.join(__dirname, 'data.json');
-const STATS_FILE = path.join(__dirname, 'stats.json');
-const DAILY_FILE = path.join(__dirname, 'daily_stats.json');
-const FETCH_INTERVAL_MS = Number(process.env.FETCH_INTERVAL_MS) || 8000;
-const MAX_HISTORY = Number(process.env.MAX_HISTORY) || 1000;
+const SOURCE_API = 'https://hackvn.xyz/apisun.php';
+const DATA_FILE = path.join(__dirname, 'data.json'); // file lưu trạng thái
 
-const ABSTAIN_MODE = process.env.ABSTAIN_MODE === 'true';
-const ABSTAIN_THRESHOLD = Number(process.env.ABSTAIN_THRESHOLD) || 0.58;
-const TUNE_WINDOW = Number(process.env.TUNE_WINDOW) || 20;
-const TUNE_STEP = Number(process.env.TUNE_STEP) || 0.05;
-const MIN_WEIGHT = 0.05;
-const SAFE_SAVE_TMP = true;
+// ======= State in-memory (will persist to DATA_FILE) =======
+let history = []; // mỗi phần tử: { phien, result, predicted, thuat_toan, correct (true/false/null), correctChecked (bool), xuc_xac, tong, timestamp }
+let correctCount = 0;
+let incorrectCount = 0;
+let processedSinceReset = 0; // tăng khi thêm phiên; nếu >=15 -> reset (giữ 5)
+const AUTO_RESET_THRESHOLD = 15;
+const KEEP_AFTER_RESET = 5;
+let lastSavedAt = 0;
 
-// ============ State ============
-let data = {
-  history: [], // newest-first
-  pendingPredictions: {}, // map predictPhien -> predictObj
-  lastPredict: null,
-  lastPhienSeen: 0,
-  streakLose: 0,
-  streakWin: 0,
-  weights: { pattern: 0.28, trend: 0.22, dice: 0.18, momentum: 0.16, memory: 0.16 },
-  prediction_history: [] // entries with snapshot + actual when available
-};
+// ======= Helpers =======
+function safeLast(arr, n) {
+  if (!Array.isArray(arr) || arr.length === 0) return [];
+  return arr.slice(-n);
+}
+function countIn(arr, val) {
+  return arr.filter(x => x === val).length;
+}
 
-// Stats normalized fields: So_lan_du_doan, So_dung, So_sai, reset
-let stats = { So_lan_du_doan: 0, So_dung: 0, So_sai: 0, reset: 0 };
-
-// Daily statistics (per calendar day)
-let dailyStats = { date: '', So_dung: 0, So_sai: 0, So_lan_du_doan: 0 };
-
-// ============ Safe IO ============
-function safeWrite(file, obj) {
-  const tmp = file + '.tmp';
-  const str = JSON.stringify(obj, null, 2);
+// ======= Persistence =======
+async function loadState() {
   try {
-    if (SAFE_SAVE_TMP) {
-      fs.writeFileSync(tmp, str, 'utf8');
-      fs.renameSync(tmp, file);
-    } else {
-      fs.writeFileSync(file, str, 'utf8');
-    }
-  } catch (e) {
-    console.error('safeWrite err', e.message);
+    const raw = await fs.readFile(DATA_FILE, 'utf8');
+    const obj = JSON.parse(raw);
+    history = obj.history || [];
+    correctCount = obj.correctCount || 0;
+    incorrectCount = obj.incorrectCount || 0;
+    processedSinceReset = obj.processedSinceReset || 0;
+    console.log('🟢 State loaded from', DATA_FILE);
+  } catch (err) {
+    // nếu file không tồn tại thì bắt đầu từ state rỗng
+    console.log('ℹ️ No saved state found, starting fresh.');
+    history = [];
+    correctCount = 0;
+    incorrectCount = 0;
+    processedSinceReset = 0;
   }
 }
 
-function safeRead(file) {
+async function saveState() {
   try {
-    if (fs.existsSync(file)) {
-      const raw = fs.readFileSync(file, 'utf8');
-      return JSON.parse(raw);
-    }
-  } catch (e) {
-    console.error('safeRead err', file, e.message);
-  }
-  return null;
-}
-
-function loadAll() {
-  try {
-    const rawData = safeRead(DATA_FILE);
-    if (rawData) {
-      Object.assign(data, rawData);
-      if (!data.weights) data.weights = { pattern: 0.28, trend: 0.22, dice: 0.18, momentum: 0.16, memory: 0.16 };
-      if (!Array.isArray(data.prediction_history)) data.prediction_history = [];
-      if (!data.pendingPredictions) data.pendingPredictions = {};
-    }
-    const s = safeRead(STATS_FILE);
-    if (s) {
-      stats = Object.assign(stats, s || {});
-    }
-    const d = safeRead(DAILY_FILE);
-    if (d) {
-      dailyStats = Object.assign(dailyStats, d || {});
-    }
-  } catch (e) {
-    console.error('loadAll err', e.message);
-  }
-}
-
-loadAll();
-
-let saveTimer = null;
-function saveAllDebounced() {
-  if (saveTimer) clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => {
-    safeWrite(DATA_FILE, data);
-    safeWrite(STATS_FILE, stats);
-    safeWrite(DAILY_FILE, dailyStats);
-    saveTimer = null;
-  }, 600);
-}
-function saveAllImmediate() {
-  safeWrite(DATA_FILE, data);
-  safeWrite(STATS_FILE, stats);
-  safeWrite(DAILY_FILE, dailyStats);
-}
-
-// ============ Utilities & Normalization ============
-function safeInt(v) { const n = parseInt(v); return Number.isFinite(n) ? n : 0; }
-function now() { return Date.now(); }
-
-function normalizeResult(s) {
-  if (!s && s !== 0) return '';
-  const t = String(s).trim().toLowerCase();
-  if (t === 't' || t.includes('tài') || t.includes('tai')) return 'Tài';
-  if (t === 'x' || t.includes('xỉu') || t.includes('xiu')) return 'Xỉu';
-  // fallback: if numeric total provided, decide by >=11 => Tài
-  const num = parseInt(s);
-  if (Number.isFinite(num)) return num >= 11 ? 'Tài' : 'Xỉu';
-  return '';
-}
-
-function currentDateKey() {
-  const d = new Date();
-  return d.toISOString().slice(0, 10); // yyyy-mm-dd
-}
-
-function rotateDailyStatsIfNeeded() {
-  const today = currentDateKey();
-  if (dailyStats.date !== today) {
-    if (dailyStats.date) {
-      // If there was a previous day saved, allow log / rotate (we keep only current in dailyStats)
-      console.log(chalk.magenta(`📊 Lưu thống kê ngày ${dailyStats.date}: đúng ${dailyStats.So_dung}/${dailyStats.So_lan_du_doan} (sai ${dailyStats.So_sai})`));
-    }
-    dailyStats = { date: today, So_dung: 0, So_sai: 0, So_lan_du_doan: 0 };
-    safeWrite(DAILY_FILE, dailyStats);
-  }
-}
-
-// ============ Predictor helpers ============
-function seqTX(history, n = 30) { return history.slice(0, n).reverse().map(h => (h.ket_qua === 'Tài' || h.ket_qua === 'T' ? 'T' : 'X')).join(''); }
-function getTrend(history, n = 6) { const arr = history.slice(0, n).map(h => h.tong_xuc_xac || 0); if (arr.length < 2) return 0; let up = 0, down = 0; for (let i = 1; i < arr.length; i++) { if (arr[i] > arr[i - 1]) up++; else if (arr[i] < arr[i - 1]) down++; } return (up - down) / n; }
-function analyzePattern(seq) { if (!seq || seq.length < 6) return { score: 0, type: 'none' }; const L = seq.length, last = seq[L - 1]; let run = 1; for (let i = L - 2; i >= 0 && seq[i] === last; i--) run++; const alt = [...seq].filter((_, i) => i && seq[i] !== seq[i - 1]).length / (L - 1); const net = [...seq].reduce((a, c) => a + (c === 'T' ? 1 : -1), 0) / L; const s = (Math.tanh((run - 2) / 3) + net * 0.55 - alt * 0.25) * (last === 'T' ? 1 : -1); let type = 'Không rõ'; if (run >= 4) type = 'Bệt'; else if (alt > 0.6) type = 'Đảo liên tục'; else if (alt < 0.3) type = 'Ổn định'; return { score: s, type }; }
-function diceBias(last) { if (!last || !Array.isArray(last.xuc_xac)) return 0; const arr = last.xuc_xac; const high = arr.filter(x => x >= 5).length; const low = arr.filter(x => x <= 2).length; if (high >= 2) return 0.7; if (low >= 2) return -0.7; const tot = arr.reduce((a, b) => a + (b || 0), 0); if (tot >= 12) return 0.3; if (tot <= 9) return -0.3; return 0; }
-function momentum(history) { const h = history.slice(0, 10); if (h.length === 0) return 0; const tai = h.filter(r => r.ket_qua === 'Tài' || r.ket_qua === 'T').length; const xiu = h.length - tai; return (tai - xiu) / (h.length || 1); }
-function memoryPattern(history) { if (history.length < 20) return 0; const last10 = seqTX(history, 10); for (let i = 15; i < 50 && i + 10 < history.length; i++) { const past10 = seqTX(history.slice(i), 10); if (past10 === last10) return 0.65 * (last10.endsWith('T') ? 1 : -1); } return 0; }
-
-function normalizeWeights(wIn) {
-  const w = Object.assign({}, wIn || {});
-  const keys = Object.keys(w);
-  if (keys.length === 0) {
-    return { pattern: 0.28, trend: 0.22, dice: 0.18, momentum: 0.16, memory: 0.16 };
-  }
-  keys.forEach(k => w[k] = Math.max(MIN_WEIGHT, Math.min(0.9, Number(w[k]) || MIN_WEIGHT)));
-  const sum = Object.values(w).reduce((a, b) => a + b, 0) || 1;
-  keys.forEach(k => w[k] = w[k] / sum);
-  return w;
-}
-
-// ============ Day-Aware Deep Fusion Predict (v26.1) ============
-function hybridEnsemblePredict(history, weights) {
-  // If not enough data, fallback to simple heuristic
-  if (!history || history.length < 5) {
-    return { du_doan: 'Tài', confidence: 0.55, patternSeq: seqTX(history || [], 30), patternType: 'none', raw: 0, components: {} };
-  }
-
-  rotateDailyStatsIfNeeded();
-
-  // base components
-  const seq = seqTX(history, 40); // longer window for pattern memory
-  const pat = analyzePattern(seq);
-  const trend = getTrend(history, 8);
-  const dice = diceBias(history[0]);
-  const mom = momentum(history);
-  const mem = memoryPattern(history);
-
-  // recent rates
-  const last15 = history.slice(0, 15);
-  const taiRate = (last15.filter(h => (h.ket_qua === 'Tài' || h.ket_qua === 'T')).length) / (last15.length || 1);
-  const xiuRate = 1 - taiRate;
-
-  // Pattern Memory Matrix: count repeats of last-8 pattern in past window
-  let patternScore = 0;
-  const memSeqs = [];
-  for (let i = 8; i < Math.min(80, history.length - 8); i++) {
-    const part = seqTX(history.slice(i), 8);
-    memSeqs.push(part);
-  }
-  const lastSeq = seqTX(history, 8);
-  const matchCount = memSeqs.filter(s => s === lastSeq).length;
-  if (matchCount > 1) {
-    patternScore = 0.35 * (lastSeq.endsWith('T') ? 1 : -1) * Math.log2(matchCount + 1);
-  }
-
-  // bias from day (use items with timestamp if available)
-  const todayKey = currentDateKey();
-  const dayHist = history.filter(h => {
-    if (h.timestamp) {
-      const d = new Date(h.timestamp).toISOString().slice(0, 10);
-      return d === todayKey;
-    }
-    // fall back: if no timestamp, include in day window if phien looks recent (best-effort)
-    return true;
-  });
-  const dayTaiRate = dayHist.length ? (dayHist.filter(h => h.ket_qua === 'Tài' || h.ket_qua === 'T').length / dayHist.length) : 0.5;
-  const dayBias = (dayTaiRate - 0.5) * 0.5;
-
-  // near-term activity
-  const recent5 = history.slice(0, 5);
-  const recMomentum = momentum(recent5);
-  const trendBoost = trend * (1 + (recMomentum * 0.3));
-
-  // Adaptive trend correction based on streaks
-  const adaptiveTrend = trendBoost * (1 + (data.streakLose > 1 ? 0.25 : 0) - (data.streakWin > 2 ? 0.18 : 0));
-
-  // fusion using normalized weights
-  const w = normalizeWeights(Object.assign({}, weights || data.weights));
-  let raw = pat.score * w.pattern
-    + adaptiveTrend * w.trend
-    + dice * w.dice
-    + mom * w.momentum
-    + mem * w.memory
-    + patternScore * 0.25;
-
-  // bias from recent outcome rates (if recent has strong skew, reflect it)
-  raw += (taiRate - xiuRate) * 0.28;
-
-  // add day bias gently
-  raw += dayBias * 0.6;
-
-  // final adaptive scaling
-  if (data.streakLose >= 2) raw *= 1.12;
-  if (data.streakWin >= 3) raw *= 0.92;
-
-  // confidence calculation
-  const confidenceBase = 0.55 + Math.min(0.4, Math.abs(raw) * 0.5);
-  const confidence = Math.min(0.99, Math.max(0.52, confidenceBase));
-
-  // decision
-  const du_doan = raw >= 0 ? 'Tài' : 'Xỉu';
-  const components = { pattern: pat.score, trend: adaptiveTrend, dice, momentum: mom, memory: mem, patternScore, taiRate, xiuRate, dayBias };
-
-  return {
-    du_doan,
-    confidence,
-    patternSeq: seq,
-    patternType: pat.type,
-    raw,
-    components
-  };
-}
-
-// ============ Fetch API (single robust impl) ============
-async function fetchFromApi() {
-  try {
-    const r = await axios.get(API_HISTORY, { timeout: 8000 });
-    let p = Array.isArray(r.data) ? r.data[0] : r.data;
-    if (typeof p === 'string') { try { p = JSON.parse(p); } catch (e) { } }
-    const phien = safeInt(p.phien || p.id || p.session || p.PHIEN || p.Phien);
-    const tong = safeInt(p.tong || p.total || p.tong_xuc_xac || p.Tong || p.TONG);
-    const ket_qua = normalizeResult(p.ket_qua || p.ketqua || p.result || (tong ? (tong >= 11 ? 'Tài' : 'Xỉu') : ''));
-    const xuc_xac = [safeInt(p.xuc_xac_1), safeInt(p.xuc_xac_2), safeInt(p.xuc_xac_3)].filter(n => n > 0);
-    if (!phien) return null;
-    return { phien, ket_qua, tong_xuc_xac: tong, xuc_xac };
-  } catch (e) {
-    return null;
-  }
-}
-
-// ============ Tuning helpers ============
-function recentLabeled(windowSize = TUNE_WINDOW) {
-  return data.prediction_history.filter(p => typeof p.correct === 'boolean').slice(-windowSize);
-}
-function computeAccuracy(records) {
-  if (!records || records.length === 0) return null;
-  const valid = records.filter(r => typeof r.correct === 'boolean');
-  if (valid.length === 0) return null;
-  return valid.filter(r => r.correct).length / valid.length;
-}
-function simpleTune() {
-  const labeled = recentLabeled(TUNE_WINDOW);
-  if (labeled.length < Math.max(8, Math.floor(TUNE_WINDOW / 2))) return;
-  const baseAcc = computeAccuracy(labeled);
-  if (baseAcc === null) return;
-  const keys = Object.keys(data.weights);
-  for (const k of keys) {
-    for (const dir of [1, -1]) {
-      const trial = Object.assign({}, data.weights);
-      trial[k] = Math.max(MIN_WEIGHT, Math.min(0.9, trial[k] * (1 + dir * TUNE_STEP)));
-      const trialNorm = normalizeWeights(trial);
-      let tot = 0, correct = 0;
-      for (const rec of labeled) {
-        if (!rec.snapshot) continue;
-        const out = hybridEnsemblePredict(rec.snapshot, trialNorm);
-        tot++;
-        if (out.du_doan === rec.actual) correct++;
-      }
-      if (tot === 0) continue;
-      const acc = correct / tot;
-      if (acc > baseAcc + 0.02) {
-        data.weights = normalizeWeights(trialNorm);
-        console.log(chalk.green(`🔧 simpleTune improved ${k} ${dir > 0 ? '+' : '-'} -> acc ${Math.round(acc * 100)}% (base ${Math.round(baseAcc * 100)}%)`));
-        saveAllDebounced();
-        return;
-      }
-    }
-  }
-}
-
-// ============ Process incoming item (correct counting) ============
-let failCount = 0;
-let lastResetAt = 0;
-
-async function processIncoming(item) {
-  // ensure item has timestamp for day-aware logic
-  item.timestamp = item.timestamp || now();
-
-  const lastPhien = data.history[0]?.phien || 0;
-  if (lastPhien && item.phien <= lastPhien) {
-    console.log(chalk.gray(`Ignored phien ${item.phien} (<= last ${lastPhien})`));
-    return;
-  }
-
-  data.history.unshift(item);
-  if (data.history.length > MAX_HISTORY) data.history = data.history.slice(0, MAX_HISTORY);
-  if (item.phien > (data.lastPhienSeen || 0)) data.lastPhienSeen = item.phien;
-
-  // finalize pending prediction for this phien
-  // CORRECT LOGIC: when we created the prediction earlier we stored it as data.pendingPredictions[nextPhien]
-  // where nextPhien = previousItem.phien + 1. The actual result for phien X should be matched to
-  // pendingPredictions[X]. So lookup by item.phien.
-  const target = data.pendingPredictions[item.phien];
-
-  // debug: show pending keys for tracing (helpful when troubleshooting)
-  if (process.env.DEBUG_PENDING === 'true') {
-    console.log(chalk.gray('Pending keys:', Object.keys(data.pendingPredictions).sort((a,b)=>a-b).join(',')));
-    console.log(chalk.gray('Incoming phien:', item.phien));
-  }
-
-  if (target) {
-    const predRec = target;
-    // Normalize both sides before compare
-    const actual = normalizeResult(item.ket_qua || item.ket_qua || item.ketqua || item.ketQua || item.Ket_qua || item.KET_QUA)
-                   || normalizeResult(item.tong_xuc_xac || item.tong || item.Tong);
-    const predicted = normalizeResult(predRec.du_doan);
-    const correct = (predicted && actual) ? (predicted === actual) : null;
-
-    // Update stats only if not abstain and we have a determinable result
-    if (!predRec.abstain) {
-      if (correct === true) {
-        stats.So_lan_du_doan = (stats.So_lan_du_doan || 0) + 1;
-        stats.So_dung = (stats.So_dung || 0) + 1;
-        dailyStats.So_dung = (dailyStats.So_dung || 0) + 1;
-        dailyStats.So_lan_du_doan = (dailyStats.So_lan_du_doan || 0) + 1;
-        data.streakWin = (data.streakWin || 0) + 1;
-        data.streakLose = 0;
-      } else if (correct === false) {
-        stats.So_lan_du_doan = (stats.So_lan_du_doan || 0) + 1;
-        stats.So_sai = (stats.So_sai || 0) + 1;
-        dailyStats.So_sai = (dailyStats.So_sai || 0) + 1;
-        dailyStats.So_lan_du_doan = (dailyStats.So_lan_du_doan || 0) + 1;
-        data.streakLose = (data.streakLose || 0) + 1;
-        data.streakWin = 0;
-      } else {
-        console.log(chalk.yellow(`⚠️ Unable to determine correct/incorrect for phien ${item.phien} (pred='${predRec.du_doan}' actual='${item.ket_qua}')`));
-      }
-    }
-
-    // update prediction_history entry if exists
-    const entry = data.prediction_history.find(p => p.predictPhien === predRec.predictPhien && typeof p.actualPhien === 'undefined');
-    if (entry) {
-      entry.actualPhien = item.phien;
-      entry.actual = actual || item.ket_qua;
-      entry.correct = (correct === true) ? true : (correct === false ? false : null);
-      entry.tsActual = now();
-    }
-
-    console.log(chalk.green(`✅ Finalized ${predRec.predictPhien}: predicted ${predRec.du_doan} (${Math.round(predRec.confidence * 100)}%) -> actual ${item.ket_qua} => ${correct === true ? 'CORRECT' : (correct === false ? 'WRONG' : 'UNKNOWN')}`));
-
-    // remove the pending entry for item.phien
-    delete data.pendingPredictions[item.phien];
-
-    rotateDailyStatsIfNeeded();
-    saveAllDebounced();
-
-    // tuning logic (unchanged)
-    const labeled = recentLabeled(TUNE_WINDOW);
-    if (labeled.length >= 8) {
-      const acc = computeAccuracy(labeled);
-      if (acc !== null && acc < 0.55) {
-        const keys = Object.keys(data.weights);
-        const k = keys[Math.floor(Math.random() * keys.length)];
-        const old = data.weights[k];
-        const neww = Math.max(MIN_WEIGHT, Math.min(0.9, old * (1 - (Math.random() * 0.12))));
-        data.weights[k] = neww;
-        data.weights = normalizeWeights(data.weights);
-        console.log(chalk.yellow(`⚙️ Auto-nudge weight ${k} -> ${data.weights[k].toFixed(3)} (acc ${Math.round(acc * 100)}%)`));
-        saveAllDebounced();
-      } else {
-        simpleTune();
-      }
-    }
-  } else {
-    // no matching pending prediction found for this phien
-    console.log(chalk.gray(`No pending prediction matched for phien ${item.phien}`));
-    // expire older pending predictions
-    const expired = Object.keys(data.pendingPredictions).map(k => parseInt(k, 10)).filter(n => !isNaN(n) && n < item.phien);
-    if (expired.length) {
-      expired.sort((a, b) => a - b);
-      for (const ph of expired) {
-        const histEntry = data.prediction_history.find(p => p.predictPhien === ph && typeof p.actualPhien === 'undefined');
-        if (histEntry) {
-          histEntry.actualPhien = null;
-          histEntry.actual = null;
-          histEntry.correct = null;
-          histEntry.tsActual = now();
-        }
-        console.log(chalk.yellow(`⏳ Pending predict ${ph} expired -> marked unknown.`));
-        delete data.pendingPredictions[ph];
-      }
-      saveAllDebounced();
-    }
-  }
-
-  // shrink if streak losing (rate-limited)
-  if ((data.streakLose || 0) >= 3) {
-    const nowTs = now();
-    if (nowTs - lastResetAt > 10 * 60 * 1000) {
-      const recent = data.prediction_history.slice(-6).filter(p => typeof p.correct === 'boolean');
-      const recentAcc = computeAccuracy(recent) || 0;
-      if (recentAcc < 0.5) {
-        console.log(chalk.yellow('♻ Shrink pattern to 5 entries due to losses'));
-        data.history = data.history.slice(0, 5);
-        data.streakLose = 0;
-        stats.reset = (stats.reset || 0) + 1;
-        data.pendingPredictions = {};
-        data.lastPredict = null;
-        lastResetAt = nowTs;
-        saveAllDebounced();
-        return;
-      }
-    }
-  }
-
-  // create new prediction for next phien
-  const nextPhien = item.phien + 1;
-  if (!data.pendingPredictions[nextPhien]) {
-    const snapshot = JSON.parse(JSON.stringify(data.history.slice(0, 100)));
-    const ai = hybridEnsemblePredict(data.history, data.weights);
-    const abstain = ABSTAIN_MODE && ai.confidence < ABSTAIN_THRESHOLD;
-    const predictObj = {
-      predictPhien: nextPhien,
-      du_doan: abstain ? 'Không chắc' : ai.du_do_an || ai.du_doan || ai.du_doan, // defensive
-      du_doan_alt: ai.du_doan,
-      confidence: ai.confidence,
-      abstain: !!abstain,
-      patternSeq: ai.patternSeq,
-      patternType: ai.patternType,
-      raw: ai.raw,
-      components: ai.components,
-      last_phien: item.phien,
-      last_ket_qua: item.ket_qua,
-      tong: item.tong_xuc_xac,
-      xuc_xac: item.xuc_xac,
-      createdAt: now()
+    const obj = {
+      history,
+      correctCount,
+      incorrectCount,
+      processedSinceReset,
+      savedAt: Date.now()
     };
-    data.pendingPredictions[nextPhien] = predictObj;
-    data.lastPredict = predictObj;
-    data.prediction_history.push({
-      predictPhien: predictObj.predictPhien,
-      du_doan: predictObj.du_doan,
-      confidence: predictObj.confidence,
-      abstain: predictObj.abstain,
-      snapshot: snapshot,
-      createdAt: predictObj.createdAt
-    });
-    if (!abstain) {
-      stats.So_lan_du_doan = (stats.So_lan_du_doan || 0) + 1;
-      rotateDailyStatsIfNeeded();
-      dailyStats.So_lan_du_doan = (dailyStats.So_lan_du_doan || 0) + 1;
+    await fs.writeFile(DATA_FILE, JSON.stringify(obj, null, 2), 'utf8');
+    lastSavedAt = Date.now();
+    // console.log('💾 State saved to', DATA_FILE);
+  } catch (err) {
+    console.error('❌ Lỗi khi lưu state:', err.message);
+  }
+}
+
+// ======= Thuật toán dự đoán (tập hợp "cầu") =======
+function predictAdvanced(hist) {
+  const n = Array.isArray(hist) ? hist.length : 0;
+  if (n < 3) {
+    return { du_doan: Math.random() > 0.5 ? 'Tài' : 'Xỉu', thuat_toan: 'Ngẫu nhiên (ít dữ liệu)', confidence: 0.45 };
+  }
+
+  const results = hist.map(h => h.result);
+  const last2 = safeLast(results, 2);
+  const last3 = safeLast(results, 3);
+  const last4 = safeLast(results, 4);
+  const last5 = safeLast(results, 5);
+  const last6 = safeLast(results, 6);
+  const last10 = safeLast(results, 10);
+  const last15 = safeLast(results, 15);
+
+  // 1) Cầu bệt >=5 -> đảo
+  if (last5.length >= 5 && last5.every(r => r === last5[0])) {
+    return { du_doan: last5[0] === 'Tài' ? 'Xỉu' : 'Tài', thuat_toan: 'Cầu bệt (>=5) -> Đảo', confidence: 0.85 };
+  }
+
+  // 2) Xen kẽ trong 4 -> đảo
+  if (last4.length >= 4) {
+    let isAlt = true;
+    for (let i = 1; i < last4.length; i++) {
+      if (last4[i] === last4[i - 1]) { isAlt = false; break; }
     }
-    saveAllDebounced();
-    console.log(chalk.cyan(`🔮 Predicted Phien ${nextPhien}: ${predictObj.du_doan} (${Math.round(predictObj.confidence * 100)}%) ${predictObj.abstain ? '(ABSTAIN)' : ''}`));
-  } else {
-    const exist = data.pendingPredictions[nextPhien];
-    exist.last_phien = item.phien;
-    exist.last_ket_qua = item.ket_qua;
-    exist.tong = item.tong_xuc_xac;
-    exist.xuc_xac = item.xuc_xac;
-    saveAllDebounced();
+    if (isAlt) {
+      return { du_doan: last4[last4.length - 1] === 'Tài' ? 'Xỉu' : 'Tài', thuat_toan: 'Cầu xen kẽ', confidence: 0.75 };
+    }
   }
+
+  // 3) Cặp đôi TTXX
+  if (last4.length === 4 && last4[0] === last4[1] && last4[2] === last4[3] && last4[0] !== last4[2]) {
+    return { du_doan: last4[2], thuat_toan: 'Cặp đôi TT|XX', confidence: 0.7 };
+  }
+
+  // 4) Đảo sau 3 cùng / 2 cùng
+  if (last3.length === 3 && last3.every(r => r === last3[0])) {
+    return { du_doan: last3[0] === 'Tài' ? 'Xỉu' : 'Tài', thuat_toan: 'Đảo sau 3 cùng', confidence: 0.82 };
+  }
+  if (last2.length === 2 && last2[0] === last2[1]) {
+    return { du_doan: last2[0] === 'Tài' ? 'Xỉu' : 'Tài', thuat_toan: 'Đảo sau 2 cùng', confidence: 0.65 };
+  }
+
+  // 5) Trend 3/4
+  if (last4.length >= 4) {
+    const taiIn4 = countIn(last4, 'Tài');
+    if (taiIn4 >= 3) return { du_doan: 'Tài', thuat_toan: 'Trend 3/4', confidence: 0.72 };
+    if (taiIn4 <= 1) return { du_doan: 'Xỉu', thuat_toan: 'Trend 3/4', confidence: 0.72 };
+  }
+
+  // 6) Chu kỳ 6
+  if (last6.length === 6) {
+    const first3 = last6.slice(0, 3).join('');
+    const last3Str = last6.slice(3, 6).join('');
+    if (first3 === last3Str) {
+      return { du_doan: last6[0], thuat_toan: 'Chu kỳ 6', confidence: 0.78 };
+    }
+  }
+
+  // 7) Markov (cơ bản) nếu có nhiều dữ liệu
+  if (n >= 15) {
+    let taiToXiu = 0, taiToTai = 0, xiuToTai = 0, xiuToXiu = 0;
+    for (let i = 1; i < hist.length; i++) {
+      if (hist[i - 1].result === 'Tài') {
+        if (hist[i].result === 'Xỉu') taiToXiu++; else taiToTai++;
+      } else {
+        if (hist[i].result === 'Tài') xiuToTai++; else xiuToXiu++;
+      }
+    }
+    const last = results[results.length - 1];
+    if (last === 'Tài') {
+      const pred = taiToXiu > taiToTai ? 'Xỉu' : 'Tài';
+      return { du_doan: pred, thuat_toan: 'Markov (Tài->?)', confidence: 0.6 };
+    } else {
+      const pred = xiuToTai > xiuToXiu ? 'Tài' : 'Xỉu';
+      return { du_doan: pred, thuat_toan: 'Markov (Xỉu->?)', confidence: 0.6 };
+    }
+  }
+
+  // 8) Độ lệch chuẩn 15 phiên
+  if (last15.length >= 15) {
+    const taiCount = countIn(last15, 'Tài');
+    const ratio = taiCount / 15;
+    if (ratio >= 0.75) return { du_doan: 'Xỉu', thuat_toan: 'Lệch chuẩn 15 (T nhiều) -> Đảo', confidence: 0.78 };
+    if (ratio <= 0.25) return { du_doan: 'Tài', thuat_toan: 'Lệch chuẩn 15 (X nhiều) -> Đảo', confidence: 0.78 };
+  }
+
+  // 9) Pattern TTX / XXT (dự đoán lặp lại)
+  if (last3.length === 3) {
+    if (last3[0] === 'Tài' && last3[1] === 'Tài' && last3[2] === 'Xỉu') return { du_doan: 'Tài', thuat_toan: 'Pattern TTX', confidence: 0.66 };
+    if (last3[0] === 'Xỉu' && last3[1] === 'Xỉu' && last3[2] === 'Tài') return { du_doan: 'Xỉu', thuat_toan: 'Pattern XXT', confidence: 0.66 };
+  }
+
+  // Fallback: đa số trong 5
+  const taiIn5 = countIn(last5, 'Tài');
+  return { du_doan: taiIn5 >= 3 ? 'Tài' : 'Xỉu', thuat_toan: 'Đa số 5 (fallback)', confidence: 0.55 };
 }
 
-// ============ Main import loop ============
-async function importAndPredict() {
-  const item = await fetchFromApi();
-  if (!item) {
-    failCount++;
-    if (failCount < 6) return;
-    if (failCount % 6 === 0) console.warn(chalk.red('⛔ Repeated fetch failures — check API source'));
-    return;
+// ======= Endpoint chính =======
+app.get('/sunwinapi', async (req, res) => {
+  try {
+    // Lấy dữ liệu nguồn
+    const response = await axios.get(SOURCE_API, { timeout: 8000 });
+    const item = response.data;
+
+    const phien = parseInt(item.phien);
+    const x1 = parseInt(item.xuc_xac_1);
+    const x2 = parseInt(item.xuc_xac_2);
+    const x3 = parseInt(item.xuc_xac_3);
+    const tong = x1 + x2 + x3;
+    const ket_qua = (item.ket_qua || '').trim() === 'Tài' ? 'Tài' : 'Xỉu';
+
+    if (isNaN(phien) || isNaN(tong) || tong < 3 || tong > 18) {
+      throw new Error('Dữ liệu nguồn không hợp lệ');
+    }
+
+    // 1) Tạo dự đoán cho "phiên kế tiếp" dựa trên lịch sử hiện tại (chưa push kết quả mới)
+    const prediction = predictAdvanced(history);
+
+    // 2) Nếu có phiên trước trong history mà đã có predicted nhưng chưa check đúng/sai -> so sánh với kết quả hiện tại
+    if (history.length > 0) {
+      const last = history[history.length - 1];
+      // last.predicted là dự đoán đã lưu trước đó cho phiên sau nó.
+      if (last.predicted && !last.correctChecked) {
+        last.correct = (last.predicted === ket_qua);
+        last.correctChecked = true;
+        if (last.correct) correctCount++;
+        else incorrectCount++;
+      }
+    }
+
+    // 3) Nếu phien mới hơn so với phien cuối history thì push record mới (kèm predicted vừa tạo)
+    if (history.length === 0 || history[history.length - 1].phien !== phien) {
+      const record = {
+        phien,
+        result: ket_qua,
+        predicted: prediction.du_doan,      // dự đoán cho phiên kế tiếp (lưu kèm)
+        thuat_toan: prediction.thuat_toan,
+        confidence: Math.round((prediction.confidence || 0) * 100) / 100,
+        correct: null,
+        correctChecked: false,
+        xuc_xac: [x1, x2, x3],
+        tong,
+        timestamp: Date.now()
+      };
+      history.push(record);
+
+      // tăng bộ đếm processedSinceReset
+      processedSinceReset++;
+
+      // Nếu đạt ngưỡng reset -> giữ lại KEEP_AFTER_RESET phiên gần nhất
+      if (processedSinceReset >= AUTO_RESET_THRESHOLD) {
+        const kept = safeLast(history, KEEP_AFTER_RESET);
+        history = kept.map(h => {
+          // reset correctChecked nếu cần (giữ nguyên đúng/sai đã check nếu có)
+          return {
+            phien: h.phien,
+            result: h.result,
+            predicted: h.predicted,
+            thuat_toan: h.thuat_toan,
+            confidence: h.confidence,
+            correct: h.correct,
+            correctChecked: h.correctChecked,
+            xuc_xac: h.xuc_xac,
+            tong: h.tong,
+            timestamp: h.timestamp
+          };
+        });
+        processedSinceReset = 0;
+        console.log(`♻️ Auto-reset sau ${AUTO_RESET_THRESHOLD} phiên — giữ lại ${KEEP_AFTER_RESET} phiên gần nhất.`);
+      }
+
+      // Giữ tổng history không quá lớn (để tránh memory leak), tối đa 500
+      if (history.length > 500) history = safeLast(history, 500);
+
+      // Lưu state vào file
+      saveState().catch(err => console.error('Lỗi khi lưu state:', err.message));
+    }
+
+    // Tạo pattern hiện tại (sau khi push)
+    const pattern = history.map(h => h.result === 'Tài' ? 't' : 'x').join('');
+
+    res.json({
+      phien,
+      ket_qua,
+      xuc_xac: [x1, x2, x3],
+      tong_xuc_xac: tong,
+      du_doan_ke_tiep: prediction.du_doan,
+      thuat_toan: prediction.thuat_toan,
+      confidence: Math.round((prediction.confidence || 0) * 100) / 100,
+      pattern,
+      correctCount,
+      incorrectCount,
+      history_length: history.length,
+      processedSinceReset,
+      id: "@minhsangdangcap"
+    });
+  } catch (err) {
+    console.error('❌ Lỗi khi gọi /sunwinapi:', err.message);
+    res.status(500).json({
+      phien: 0,
+      ket_qua: "Lỗi",
+      xuc_xac: [0,0,0],
+      tong_xuc_xac: 0,
+      du_doan_ke_tiep: "Lỗi",
+      thuat_toan: "Lỗi hệ thống",
+      correctCount,
+      incorrectCount,
+      history_length: history.length,
+      id: "@minhsangdangcap"
+    });
   }
-  failCount = 0;
-  await processIncoming(item);
-}
+});
 
-setInterval(importAndPredict, FETCH_INTERVAL_MS);
-importAndPredict();
-
-// ============ Endpoints ============
-app.get('/sunwinapi', (req, res) => {
-  const p = data.lastPredict || (() => {
-    const keys = Object.keys(data.pendingPredictions).map(k => parseInt(k, 10)).filter(n => !isNaN(n));
-    if (!keys.length) return null;
-    const max = Math.max(...keys);
-    return data.pendingPredictions[max];
-  })();
-  if (!p) return res.json({ message: 'Chưa có dữ liệu' });
+// ======= Optional: endpoint trả về toàn bộ history + stats (truy vấn nội bộ) =======
+app.get('/stats', (req, res) => {
+  // Trả về summary và 20 phiên gần nhất
+  const recent = safeLast(history, 20);
   res.json({
-    Phien: p.last_phien || null,
-    Ket_qua: p.last_ket_qua || null,
-    Tong: p.tong || null,
-    Xuc_xac: p.xuc_xac || [],
-    Du_doan: p.du_doan,
-    Confidence: `${Math.round(p.confidence * 100)}%`,
-    Pattern: p.patternSeq,
-    Loai_cau: p.patternType,
-    Thuat_toan: 'HYBRID+ DAY_AWARE_DEEP_ENSEMBLE_V26.1',
-    So_lan_du_doan: stats.So_lan_du_doan || 0,
-    So_dung: stats.So_dung || 0,
-    So_sai: stats.So_sai || 0,
-    Dev: '@minhsangdangcap'
+    correctCount,
+    incorrectCount,
+    history_length: history.length,
+    processedSinceReset,
+    recent,
   });
 });
 
-app.get('/stats', (req, res) => res.json(stats));
-app.get('/weights', (req, res) => res.json(data.weights));
-app.get('/daily', (req, res) => { rotateDailyStatsIfNeeded(); res.json(dailyStats); });
-
-app.post('/setweights', (req, res) => {
-  const w = req.body;
-  if (!w || typeof w !== 'object') return res.status(400).json({ error: 'send JSON weights' });
-  data.weights = normalizeWeights(Object.assign({}, data.weights, w));
-  saveAllDebounced();
-  res.json({ ok: true, weights: data.weights });
+app.get('/', (req, res) => {
+  res.json({ message: "✅ botrumsunwinapi - SUN.WIN (v4.0 persistent + auto-reset)", endpoint: "/sunwinapi" });
 });
 
-app.get('/predhistory', (req, res) => {
-  const out = data.prediction_history.slice(-200).map(p => ({
-    predictPhien: p.predictPhien,
-    du_doan: p.du_doan,
-    confidence: p.confidence,
-    abstain: p.abstain,
-    actualPhien: p.actualPhien,
-    actual: p.actual,
-    correct: p.correct,
-    createdAt: p.createdAt,
-    tsActual: p.tsActual
-  }));
-  res.json(out);
-});
-
-app.get('/history', (req, res) => res.json(data.history));
-
-app.post('/tune', (req, res) => {
-  const body = req.body || {};
-  if (body.action === 'nudge' && body.key && data.weights[body.key] !== undefined) {
-    data.weights[body.key] = Math.max(MIN_WEIGHT, Math.min(0.9, data.weights[body.key] * (body.factor || 0.9)));
-    data.weights = normalizeWeights(data.weights);
-    saveAllDebounced();
-    return res.json({ ok: true, weights: data.weights });
-  }
-  return res.status(400).json({ error: 'invalid' });
-});
-
-app.get('/diagnostics', (req, res) => {
-  const labeled = data.prediction_history.filter(p => typeof p.correct === 'boolean');
-  const acc = computeAccuracy(labeled) || 0;
-  res.json({
-    weights: data.weights,
-    lastPredict: data.lastPredict,
-    pendingCount: Object.keys(data.pendingPredictions).length,
-    rolling_accuracy: Math.round(acc * 10000) / 100,
-    labeled_count: labeled.length,
-    failCount,
-    streakWin: data.streakWin,
-    streakLose: data.streakLose,
-    lastPhienSeen: data.lastPhienSeen
-  });
-});
-
-app.get('/resetpattern', (req, res) => {
-  data.history = data.history.slice(0, 5);
-  data.streakLose = 0; data.streakWin = 0;
-  data.pendingPredictions = {};
-  stats.reset = (stats.reset || 0) + 1;
-  saveAllDebounced();
-  res.json({ ok: true, message: 'reset pattern (stats giữ)' });
-});
-
-app.get('/resetall', (req, res) => {
-  data = { history: [], pendingPredictions: {}, lastPredict: null, lastPhienSeen: 0, streakLose: 0, streakWin: 0, weights: { pattern: 0.28, trend: 0.22, dice: 0.18, momentum: 0.16, memory: 0.16 }, prediction_history: [] };
-  stats = { So_lan_du_doan: 0, So_dung: 0, So_sai: 0, reset: 0 };
-  dailyStats = { date: currentDateKey(), So_dung: 0, So_sai: 0, So_lan_du_doan: 0 };
-  saveAllImmediate();
-  res.json({ ok: true, message: 'reset all' });
-});
-
-// ============ Start server ============
-app.listen(PORT, () => console.log(chalk.green(`🚀 HYBRIDPLUS v26.1 running at http://0.0.0.0:${PORT}`)));
+// ======= Start: load saved state trước khi listen =======
+(async () => {
+  await loadState();
+  // lưu state ban đầu (để tạo file nếu chưa có)
+  await saveState();
+  app.listen(PORT, () => console.log(`🚀 Server chạy trên cổng ${PORT}`));
+})();
